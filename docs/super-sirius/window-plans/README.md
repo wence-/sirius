@@ -1,6 +1,7 @@
 # SQL window implementation plans
 
-Status: proposed, documentation only. No window implementation, GPU validation,
+Status: Plan 1 slice 1 has a bound-planning implementation with execution still
+gated on CPU fallback. Later slices remain proposed. No GPU window validation
 or performance result is implied. These plans supersede the implementation route
 in the older `wence/fea/window-functions` branch. Do not import its ordering
 directory, placement, bounded-merge, or continuation machinery as prerequisites.

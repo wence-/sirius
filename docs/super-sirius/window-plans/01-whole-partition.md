@@ -84,6 +84,48 @@ type, per-bucket ledger, or new cuCascade API is needed for this barrier.
 
 ### 1. Bound planning and capability gate
 
+Implementation status: the planning slice lives in
+`src/planner/sirius_plan_window.{hpp,cpp}`. The `LogicalWindow` dispatcher calls
+the builder, which validates and prepares a planning IR, then deliberately throws
+`NotImplementedException` until slices 2–4 provide execution. Ordinary SQL still
+uses the existing CPU fallback; no GPU window execution is enabled by this slice.
+
+The initial **planning** matrix is:
+
+| Item | Accepted |
+| --- | --- |
+| Functions | SUM and AVG with exactly one argument |
+| Argument types | Signed TINYINT/SMALLINT/INTEGER/BIGINT, FLOAT/DOUBLE, DECIMAL through precision 38 |
+| SUM result | Exact bound HUGEINT for signed integers, DOUBLE for floating arguments, DECIMAL(38, input scale) for decimals |
+| AVG result | Bound DOUBLE; decimal argument scale is retained |
+| Partition keys | BOOLEAN, signed integers through BIGINT, DATE, TIMESTAMP/TIMESTAMP_S/TIMESTAMP_MS/TIMESTAMP_NS, uncollated VARCHAR |
+| Frames | Unordered UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING, or to CURRENT ROW RANGE (all rows are peers without ordering) |
+| Multiple expressions | Equivalent partition keys, including different key order; result order follows the logical window expression order |
+
+Ordered frames (even explicitly whole), current-row ROWS frames, DISTINCT,
+FILTER, EXCLUDE, argument ordering, IGNORE NULLS, non-SUM/AVG functions,
+unsupported types, volatile expressions, and untranslatable key/argument
+expressions are rejected during planning. COUNT/MIN/MAX remain follow-ups.
+DuckDB may bind a SQL argument through a cast; the matrix applies to the bound
+argument, after that cast.
+
+Original input slots remain intact. Bare references reuse their input slots;
+equal deterministic hidden expressions share one appended preparation slot,
+including an expression used as both a key and an argument. One shared key-slot
+list describes the entire stage. Hidden slots remain in `prepared_types` through
+their final use; visible `output_types` contain only original input columns plus
+window results. Each result records its argument slot/type, exact bound result
+type, original bound frame endpoints, and visible output slot. The IR owns Sirius
+AST expressions and does not consume the DuckDB logical plan.
+
+In particular, no HUGEINT downcast or decimal result narrowing happens here.
+Execution must honor these contracts before activation, or narrow the capability
+matrix with corresponding tests. DECIMAL(38, scale) arguments matter for the
+TPC-DS shapes `sum(sum(sales)) OVER (...)` and `avg(sum(sales)) OVER (...)`:
+the inner grouped SUM already widens a DECIMAL sales column to precision 38.
+`test/cpp/planner/test_window_plan.cpp` checks these shapes through DuckDB's
+optimizer; it does not establish full TPC-DS query support.
+
 Add a `LogicalWindow` plan-builder seam at the current rejection in
 `src/planner/sirius_physical_plan_generator.cpp`. Inspect the current
 `duckdb/.../bound_window_expression.hpp` and DuckDB physical window planner.
