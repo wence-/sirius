@@ -16,6 +16,10 @@
 
 cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
+# Disable automatic C++ module scanning until RAPIDS upgrades sccache: its
+# current version handles the resulting -M* flags incorrectly with GCC >= 14.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 project(
   sirius
   VERSION 0.0.0

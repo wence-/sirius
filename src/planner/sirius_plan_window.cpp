@@ -16,13 +16,24 @@
 
 #include "planner/sirius_plan_window.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "expression/ast/from_duckdb.hpp"
+#include "expression/ast/reference.hpp"
+#include "expression/ast/utils.hpp"
+#include "helper/type_conversions.hpp"
+#include "op/partition/partition_sizing.hpp"
+#include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_partition.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
+
+#include <limits>
+#include <stdexcept>
 
 namespace sirius::planner {
 namespace {
@@ -191,13 +202,74 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
   return plan;
 }
 
+duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_input(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  whole_partition_window_plan const& plan,
+  std::size_t estimated_cardinality,
+  uint64_t hash_partition_bytes)
+{
+  if (hash_partition_bytes == 0) {
+    throw std::invalid_argument("Partition byte target must be positive");
+  }
+  if (!child || child->types.size() != plan.input_width ||
+      plan.prepared_types.size() != plan.input_width + plan.hidden_expressions.size()) {
+    throw duckdb::InternalException("Window preparation schema does not match its child");
+  }
+  auto prepared = sirius::from_duckdb_vec(plan.prepared_types);
+  duckdb::vector<std::unique_ptr<ast::node>> select;
+  for (duckdb::idx_t i = 0; i < plan.input_width; ++i) {
+    if (child->types[i] != prepared[i]) {
+      throw duckdb::InternalException("Window child type mismatch");
+    }
+    select.push_back(
+      std::make_unique<ast::node>(ast::reference{static_cast<uint32_t>(i), prepared[i]}));
+  }
+  for (auto const& expression : plan.hidden_expressions) {
+    select.push_back(ast::clone(*expression));
+  }
+  child = push_projection(std::move(child), prepared, std::move(select), estimated_cardinality);
+  std::vector<int> keys;
+  for (auto slot : plan.partition_slots) {
+    if (slot > static_cast<duckdb::idx_t>(std::numeric_limits<int>::max())) {
+      throw duckdb::NotImplementedException("Window partition slot exceeds the native index range");
+    }
+    keys.push_back(static_cast<int>(slot));
+  }
+  auto assembly = duckdb::make_uniq<op::sirius_physical_concat>(
+    prepared, estimated_cardinality, /*concat_all=*/true);
+  op::partition_spec spec;
+  spec.mode = keys.empty() ? op::partition_mode::single : op::partition_mode::hash;
+  for (auto key : keys) {
+    spec.key_cast_types.push_back(sirius::get_cudf_type(prepared[key]));
+  }
+  spec.key_columns = std::move(keys);
+  auto exchange    = duckdb::make_uniq<op::sirius_physical_partition>(
+    prepared, estimated_cardinality, std::move(spec), op::MemoryBarrierType::FULL);
+  if (plan.partition_slots.empty()) {
+    exchange->set_fixed_layout({op::partition_mode::single, op::partition_placement::unpinned(1)});
+  } else {
+    op::partition_exchange::bind(
+      {exchange.get()},
+      0,
+      false,
+      [target = hash_partition_bytes, receiver = assembly.get()](auto const& stats, bool) {
+        auto count = op::natural_num_partitions(stats[0].bytes, target, receiver->num_gpus());
+        return std::vector<op::partition_layout>{
+          {op::partition_mode::hash, op::partition_placement::unpinned(count)}};
+      });
+  }
+  exchange->children.push_back(std::move(child));
+  assembly->children.push_back(std::move(exchange));
+  return assembly;
+}
+
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(
   duckdb::LogicalWindow& window)
 {
   auto bound_plan = plan_whole_partition_window(window);
-  // Slice 1 deliberately stops before constructing an executable operator. Keep
-  // the existing plan-time fallback until complete-bucket assembly and reduction
-  // can uphold this IR's row-association and exact result-type contracts.
+  // The input builder now implements complete-bucket assembly, but its schema
+  // contains prepared input columns, not SQL results. Keep plan-time fallback
+  // until reduction/expansion upholds the bound output/type contracts.
   throw duckdb::NotImplementedException(
     "Whole-partition window execution is not implemented (%llu expressions planned)",
     static_cast<unsigned long long>(bound_plan.expressions.size()));

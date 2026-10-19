@@ -19,6 +19,8 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "expression/ast/node.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "sirius_config.hpp"
 
 #include <memory>
 #include <vector>
@@ -59,5 +61,14 @@ struct whole_partition_window_plan {
 // empty input. Hidden columns must survive through reduction/expansion and be
 // removed when the visible output is published.
 whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window);
+
+// Build only prepared-input -> PARTITION -> CONCAT (concat_all = true). The result
+// exposes prepared_types, without SQL window results. SQL planning stays gated
+// until reduction/expansion implements the rest of the bound plan.
+duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_input(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  whole_partition_window_plan const& plan,
+  std::size_t estimated_cardinality,
+  uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
 
 }  // namespace sirius::planner

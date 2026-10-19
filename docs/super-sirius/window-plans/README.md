@@ -1,8 +1,9 @@
 # SQL window implementation plans
 
-Status: Plan 1 slice 1 has a bound-planning implementation with execution still
-gated on CPU fallback. Later slices remain proposed. No GPU window validation
-or performance result is implied. These plans supersede the implementation route
+Status: Plan 1 has bound planning (slice 1) and complete-bucket input assembly
+(slice 2), with SQL execution still gated on CPU fallback. Reduction and activation
+remain proposed. No end-to-end GPU window validation or performance result is
+implied. These plans supersede the implementation route
 in the older `wence/fea/window-functions` branch. Do not import its ordering
 directory, placement, bounded-merge, or continuation machinery as prerequisites.
 
@@ -48,7 +49,7 @@ the task creator follows that dependency upstream. Pipeline completion schedules
 downstream consumers to recheck readiness. No GPU worker waits at the barrier.
 
 This is a pipeline-wide completion barrier, not per-bucket completion. After it
-opens, the window source coordinates whole-bucket claims. A readiness hint does
+opens, generic CONCAT coordinates whole-bucket claims. A readiness hint does
 not reserve input, and a `nullopt` hint is not a completion certificate. Repository
 emptiness and the pipeline finished flag alone do not establish successful query
 execution. Keep failure/cancellation handling in the existing lifecycle.

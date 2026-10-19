@@ -23,9 +23,22 @@
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "helper/type_conversions.hpp"
+#include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_dummy_scan.hpp"
+#include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_passthrough_sink.hpp"
+#include "op/sirius_physical_projection.hpp"
+#include "operator/operator_test_utils.hpp"
+#include "pipeline/repository_wiring.hpp"
+#include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_window.hpp"
 #include "utils/parquet_fixture_utils.hpp"
+
+#include <algorithm>
+#include <map>
+#include <set>
 
 using sirius::planner::plan_whole_partition_window;
 using sirius::planner::whole_partition_function;
@@ -65,13 +78,22 @@ struct window_fixture {
   }
 };
 
-duckdb::LogicalWindow& find_window(duckdb::LogicalOperator& plan)
+duckdb::LogicalWindow* find_window_if_present(duckdb::LogicalOperator& plan)
 {
   if (plan.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW) {
-    return plan.Cast<duckdb::LogicalWindow>();
+    return &plan.Cast<duckdb::LogicalWindow>();
   }
-  REQUIRE(plan.children.size() == 1);
-  return find_window(*plan.children[0]);
+  for (auto& child : plan.children) {
+    if (auto* window = find_window_if_present(*child)) { return window; }
+  }
+  return nullptr;
+}
+
+duckdb::LogicalWindow& find_window(duckdb::LogicalOperator& plan)
+{
+  auto* window = find_window_if_present(plan);
+  REQUIRE(window);
+  return *window;
 }
 
 }  // namespace
@@ -225,12 +247,133 @@ TEST_CASE("whole-partition window planning checks optimized TPC-DS shapes",
 {
   window_fixture fixture;
   auto const aggregate = GENERATE("sum", "avg");
-  // Q12/Q20/Q98 sum grouped decimal sales; Q53/Q63/Q89 average them.
-  // Use the real optimizer: an input SUM widens DECIMAL(18,2) to DECIMAL(38,2).
-  auto logical = fixture.bind(
-    std::string("SELECT ") + aggregate + "(sum(d)) OVER (PARTITION BY p) FROM w GROUP BY p, q",
-    true);
-  auto plan = plan_whole_partition_window(find_window(*logical));
+  // The grouped SUM widens decimal sales before the window consumes them.
+  auto const query =
+    std::string("SELECT ") + aggregate + "(sum(d)) OVER (PARTITION BY p) FROM w GROUP BY p, q";
+  auto logical = fixture.bind(query);
+  auto plan    = plan_whole_partition_window(find_window(*logical));
   REQUIRE(plan.expressions.size() == 1);
   CHECK(plan.expressions[0].argument_type == duckdb::LogicalType::DECIMAL(38, 2));
+
+  auto optimized = fixture.bind(query, true);
+  CHECK(optimized->types == logical->types);
+  if (auto* window = find_window_if_present(*optimized)) {
+    auto optimized_plan = plan_whole_partition_window(*window);
+    REQUIRE(optimized_plan.expressions.size() == 1);
+    CHECK(optimized_plan.expressions[0].argument_type == duckdb::LogicalType::DECIMAL(38, 2));
+  } else {
+    // WINDOW_SELF_JOIN can replace this entire window with aggregation + join.
+    // Such a plan supplies no evidence of GPU window execution.
+    SUCCEED("DuckDB eliminated the window from this optimized TPC-DS shape");
+  }
+}
+
+TEST_CASE("window input builder prepares expressions and materializes complete CONCAT wiring",
+          "[planner][window_plan][window_input_plan]")
+{
+  window_fixture fixture;
+  auto const partitioned = GENERATE(false, true);
+  auto logical = fixture.bind(partitioned ? "SELECT sum(v+1) OVER (PARTITION BY p+1) FROM w"
+                                          : "SELECT sum(v+1) OVER () FROM w");
+  auto bound   = plan_whole_partition_window(find_window(*logical));
+  auto const input_types = sirius::from_duckdb_vec(find_window(*logical).children[0]->types);
+  auto child    = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(input_types, 10);
+  auto assembly = sirius::planner::build_whole_partition_window_input(std::move(child), bound, 10);
+  auto* input   = &assembly->Cast<sirius::op::sirius_physical_concat>();
+  REQUIRE(assembly->types == sirius::from_duckdb_vec(bound.prepared_types));
+  REQUIRE(assembly->children.size() == 1);
+  auto& exchange = assembly->children[0]->Cast<sirius::op::sirius_physical_partition>();
+  std::vector<int> keys(bound.partition_slots.begin(), bound.partition_slots.end());
+  CHECK(exchange.partition_keys() == keys);
+  CHECK(exchange.input_barrier_for(*exchange.children[0]) == sirius::op::MemoryBarrierType::FULL);
+  REQUIRE(exchange.children.size() == 1);
+  auto& projection = exchange.children[0]->Cast<sirius::op::sirius_physical_projection>();
+  CHECK(projection.select_list.size() == bound.prepared_types.size());
+
+  auto root =
+    duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(assembly->types, 10, "default");
+  root->children.push_back(std::move(assembly));
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*root, nullptr);
+  sirius::pipeline::pipeline_build_context context{nullptr};
+  sirius::pipeline::sirius_pipeline_build_state state;
+  auto meta = std::make_shared<sirius::pipeline::sirius_meta_pipeline>(context, state, nullptr);
+  meta->build(*root);
+  meta->ready();
+  sirius::pipeline::sirius_pipeline_converter converter(context);
+  auto converted = converter.convert(*meta);
+  sirius::pipeline::assign_operator_ids(converted.scheduled_pipelines);
+  cucascade::shared_data_repository_manager repositories;
+  sirius::pipeline::materialize_repository_wiring(converted.repository_wirings, repositories);
+  auto* port = input->get_port("default");
+  REQUIRE(port);
+  // CONCAT keeps its ordinary streaming port, but concat_all gates claims on completion.
+  CHECK(port->type == sirius::op::MemoryBarrierType::PARTIAL);
+  auto hint = input->get_next_task_hint();
+  REQUIRE(hint);
+  CHECK(hint->hint == sirius::op::TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(port->src_pipeline);
+  CHECK(port->src_pipeline->get_sink().get() == &exchange);
+  CHECK(port->dest_pipeline->get_source().get() == input);
+  CHECK(repositories.get_repository(input->get_operator_id(), "default").get() == port->repo);
+}
+
+TEST_CASE("window input builder assembles fragmented keyed and unkeyed input",
+          "[planner][window_input_plan][gpu]")
+{
+  using namespace sirius::op;
+  using namespace sirius::test::operator_utils;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto& space  = *manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  window_fixture fixture;
+  auto const keyed = GENERATE(false, true);
+  auto logical = fixture.bind(keyed ? "SELECT sum(p) OVER (PARTITION BY p) FROM (SELECT p FROM w)"
+                                    : "SELECT sum(p) OVER () FROM (SELECT p FROM w)");
+  auto& window = find_window(*logical);
+  auto bound   = plan_whole_partition_window(window);
+  REQUIRE(bound.input_width == 1);
+  auto types    = sirius::from_duckdb_vec(window.children[0]->types);
+  auto first    = make_numeric_batch<int32_t>(space, {1, 2, 1}, cudf::type_id::INT32);
+  auto second   = make_numeric_batch<int32_t>(space, {2, 3, 1}, cudf::type_id::INT32);
+  auto target   = first->to_read_only().get_data()->get_size_in_bytes();
+  auto assembly = sirius::planner::build_whole_partition_window_input(
+    duckdb::make_uniq<sirius_physical_dummy_scan>(types, 6), bound, 6, target);
+  auto& concat = assembly->Cast<sirius_physical_concat>();
+  auto& router = concat.children[0]->Cast<sirius_physical_partition>();
+  cucascade::shared_data_repository input, buckets;
+  auto attach = [](sirius_physical_operator& op, cucascade::shared_data_repository& repo) {
+    auto port  = std::make_unique<sirius_physical_operator::port>();
+    port->repo = &repo;
+    port->type = MemoryBarrierType::FULL;
+    op.add_port("default", std::move(port));
+  };
+  attach(router, input);
+  attach(concat, buckets);
+  router.add_next_port_after_sink({&concat, "default"});
+  input.add_data_batch(first);
+  input.add_data_batch(second);
+  while (auto data = router.get_next_task_input_data()) {
+    data->prepare_for_processing(&space, default_stream());
+    auto result = router.execute(*data, default_stream());
+    router.sink(*result, default_stream());
+  }
+  CHECK(buckets.num_partitions() == (keyed ? 2 : 1));
+  std::vector<int32_t> values;
+  std::set<std::size_t> claimed;
+  std::map<int32_t, std::size_t> key_buckets;
+  while (auto data = concat.get_next_task_input_data()) {
+    auto const bucket = *dynamic_cast<partitioned_operator_data&>(*data).get_partition_idx();
+    CHECK(claimed.insert(bucket).second);
+    data->prepare_for_processing(&space, default_stream());
+    auto result  = concat.execute(*data, default_stream());
+    auto batches = dynamic_cast<pipelineable_operator_data&>(*result).get_read_only_batches();
+    REQUIRE(batches.size() == 1);
+    for (auto value :
+         copy_column_to_host<int32_t>(sirius::get_cudf_table_view(batches[0]).column(0))) {
+      auto position = key_buckets.emplace(value, bucket).first;
+      CHECK(position->second == bucket);
+      values.push_back(value);
+    }
+  }
+  std::sort(values.begin(), values.end());
+  CHECK(values == std::vector<int32_t>{1, 1, 1, 2, 2, 3});
 }

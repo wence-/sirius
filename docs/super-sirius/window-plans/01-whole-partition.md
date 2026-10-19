@@ -35,7 +35,7 @@ protocol. The relevant implementation seams are:
 | `task_creator::get_operator_for_next_task()` | Follow WAITING hints upstream to find work that can make progress |
 | `sirius_pipeline::update_pipeline_status()` | Establish completion using source/input exhaustion and task accounting, including intentional LIMIT termination |
 | `sirius_pipeline::notify_downstream_pipelines()` | Schedule consumers to recheck readiness after completion |
-| Window source `get_next_task_input_data()` | Claim one whole completed bucket under coordinated task creation |
+| CONCAT source `get_next_task_input_data()` | Claim one whole completed bucket under coordinated task creation |
 
 Source locations: `src/op/sirius_physical_operator.cpp`,
 `src/creator/task_creator.cpp`, `src/pipeline/sirius_pipeline.cpp`, and
@@ -87,7 +87,7 @@ type, per-bucket ledger, or new cuCascade API is needed for this barrier.
 Implementation status: the planning slice lives in
 `src/planner/sirius_plan_window.{hpp,cpp}`. The `LogicalWindow` dispatcher calls
 the builder, which validates and prepares a planning IR, then deliberately throws
-`NotImplementedException` until slices 2–4 provide execution. Ordinary SQL still
+`NotImplementedException` until slices 3–4 provide reduction and SQL activation. Ordinary SQL still
 uses the existing CPU fallback; no GPU window execution is enabled by this slice.
 
 The initial **planning** matrix is:
@@ -144,20 +144,36 @@ unsupported cases cannot reach execution, and result slots/types are correct.
 
 ### 2. Complete-bucket input organization
 
-Reuse indexed hash routing and repository registration. Require a FULL barrier
-and atomically coordinated whole-bucket task claims; skip empty buckets without
-losing later work. A drained repository is not itself producer completion.
-Implement the barrier communication and bucket-claim contract above using the
-existing hint traversal and downstream scheduling, without polling or blocking
-a GPU worker. Ensure wiring retains the correct upstream pipeline reference.
-For no partition keys, route all input to one work unit. Use ordinary placement
-and cross-device preparation rather than new affinity machinery.
+Implementation: `build_whole_partition_window_input()` constructs a prepared
+projection, a shared PARTITION router with explicit keys, and the generic
+`sirius_physical_concat` with `concat_all = true`. This input-stage builder
+returns the prepared schema, without SQL window results. SQL planning continues
+to throw until reduction/expansion is available.
 
-Inspect reuse boundaries carefully: current `sirius_physical_concat` is configured
-through a downstream join and can emit partial buckets. Do not construct a dummy
-join or reuse partial concatenation for windows. Reuse the concatenation primitive
-and partition-consumer mechanics, with a narrow window-owned complete-bucket path
-or a small justified extraction of shared code. Avoid broad join-policy refactors.
+The planner supplies normalized key types and binds a byte-target sizing policy through the
+shared `partition_exchange`. Without keys it installs a fixed single-destination layout.
+The router's declared ingress is FULL so sizing observes the completed input, subject to the
+existing producer protocol. CONCAT consumes the resulting layout and does not select keys or
+partition counts. Placement stays unpinned, using ordinary task locality and cross-device
+preparation. No window-specific constructor, sizing branch, or consumer pointer is needed
+inside PARTITION.
+
+CONCAT requires producer completion before claiming an entire nonempty partition
+under its drain lock, skipping empty gaps. Its ordinary publication preserves
+partition indices and row order within the repository's batch sequence. Generic
+CONCAT preparation checks decoded input capacity and native row-count limits;
+concatenation uses its existing memory estimates and native error propagation.
+No-key windows must fit as one complete input. Slice 3 must extend accounting for
+aggregate outputs, expansion maps, and scratch before activation.
+
+The planner suite checks the PARTITION -> CONCAT tree through pipeline conversion
+and repository materialization, including the FULL exchange ingress and the
+producing pipeline reference. CONCAT retains its ordinary PARTIAL port; its
+`concat_all` hint and claim paths enforce producer-completion gating. Generic CONCAT tests cover complete claims, empty gaps, concurrent
+claims, output partition indices, capacity/row-count rejection, and cross-device
+preparation. Window input-stage tests exercise the actual builder for hash sizing and no-key gather.
+These checks do not establish end-to-end SQL window execution. Validation results
+from the superseded window-owned assembly operator do not validate this wiring.
 
 Account for retained input plus assembly, outputs, and scratch in admission.
 Define the behavior of impossible working sets and native row-count overflow;
