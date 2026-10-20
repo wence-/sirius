@@ -29,6 +29,7 @@
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_passthrough_sink.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_window.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
@@ -184,6 +185,8 @@ TEST_CASE("whole-partition window planning rejects unsupported bound semantics",
     "rank() OVER (ORDER BY p)",
     "lag(v) OVER ()",
     "sum(v::HUGEINT) OVER ()",
+    "sum(v::DECIMAL(4,0)) OVER ()",
+    "avg(v::DECIMAL(4,0)) OVER ()",
     "sum(v::UBIGINT) OVER ()",
     "sum(v) OVER (PARTITION BY [p])",
     "sum(v) OVER (PARTITION BY f)",
@@ -211,17 +214,43 @@ TEST_CASE("whole-partition window planning retains decimal widening", "[planner]
   CHECK(plan.expressions[2].result_type == duckdb::LogicalType::DOUBLE);
 }
 
-TEST_CASE("whole-partition window planner seam keeps runtime fallback closed",
+TEST_CASE("whole-partition window planner activates only admitted windows",
           "[planner][window_plan]")
 {
   window_fixture fixture;
-  auto const supported = GENERATE(false, true);
-  auto logical         = fixture.bind(supported ? "SELECT sum(v) OVER () FROM w"
-                                        : "SELECT sum(v) OVER (ORDER BY p) FROM w");
+  auto logical = fixture.bind("SELECT sum(v) OVER (ORDER BY p) FROM w");
   sirius::planner::sirius_physical_plan_generator generator(*fixture.con.context);
   REQUIRE_THROWS_WITH(generator.create_plan(std::move(logical)),
-                      Catch::Matchers::ContainsSubstring(supported ? "execution is not implemented"
-                                                                   : "window ORDER BY"));
+                      Catch::Matchers::ContainsSubstring("window ORDER BY"));
+  logical       = fixture.bind("SELECT sum(v) OVER () FROM (VALUES (1),(2)) t(v)");
+  auto physical = generator.create_plan(std::move(logical));
+  auto find     = [](auto&& self, sirius::op::sirius_physical_operator& op) -> bool {
+    if (op.type == sirius::op::SiriusPhysicalOperatorType::WINDOW) {
+      CHECK(op.types.back() == sirius::logical_type::make(sirius::type_id::HUGEINT));
+      REQUIRE(op.children.size() == 1);
+      CHECK(op.children[0]->type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
+      CHECK(op.children[0]->children[0]->type == sirius::op::SiriusPhysicalOperatorType::PARTITION);
+      return true;
+    }
+    for (auto& child : op.children) {
+      if (self(self, *child)) { return true; }
+    }
+    return false;
+  };
+  REQUIRE(find(find, *physical));
+}
+
+TEST_CASE("whole-partition activation rejects unsafe consumers and chained stages",
+          "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto const query = GENERATE(
+    "SELECT sum(v) OVER ()+1 FROM w",
+    "SELECT s,count(*) FROM (SELECT sum(v) OVER () s FROM w) t GROUP BY s",
+    "SELECT sum(s) OVER (PARTITION BY p) FROM (SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t");
+  auto logical = fixture.bind(query);
+  REQUIRE_THROWS_AS(sirius::planner::validate_whole_partition_window_consumers(*logical),
+                    duckdb::NotImplementedException);
 }
 
 TEST_CASE("whole-partition window planning rejects invalid mappings and null treatment",
@@ -240,6 +269,23 @@ TEST_CASE("whole-partition window planning rejects invalid mappings and null tre
       window.children[0]->types.size();
   }
   REQUIRE_THROWS_AS(plan_whole_partition_window(window), duckdb::NotImplementedException);
+}
+
+TEST_CASE("whole-partition planning accepts statistics-optimized SUM", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  REQUIRE_FALSE(fixture.con.Query("INSERT INTO w(p,v) VALUES (1,10),(1,20)")->HasError());
+  auto settings = fixture.con.Query("SELECT current_setting('disabled_optimizers')");
+  REQUIRE_FALSE(settings->HasError());
+  auto const current = settings->Collection().GetValue(0, 0).ToString();
+  REQUIRE_FALSE(fixture.con
+                  .Query("SET disabled_optimizers='" + current + (current.empty() ? "" : ",") +
+                         "window_self_join'")
+                  ->HasError());
+  auto logical = fixture.bind("SELECT p,sum(v) OVER (PARTITION BY p) FROM w", true);
+  auto plan    = plan_whole_partition_window(find_window(*logical));
+  REQUIRE(plan.expressions.size() == 1);
+  CHECK(plan.expressions[0].result_type == duckdb::LogicalType::HUGEINT);
 }
 
 TEST_CASE("whole-partition window planning checks optimized TPC-DS shapes",
@@ -376,4 +422,78 @@ TEST_CASE("window input builder assembles fragmented keyed and unkeyed input",
   }
   std::sort(values.begin(), values.end());
   CHECK(values == std::vector<int32_t>{1, 1, 1, 2, 2, 3});
+}
+
+TEST_CASE("window adapter restores narrow inputs and removes hidden slots", "[window_adapter][gpu]")
+{
+  using namespace sirius::op;
+  using namespace sirius::test::operator_utils;
+  using sirius::logical_type;
+  using sirius::type_id;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto& space  = *manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  // Both columns are compressed INTEGERs. Slot 1 is a hidden argument, not visible payload.
+  auto batch = make_two_column_batch<int8_t, int8_t>(
+    space, {1, 2, 1, 2}, {10, 20, 30, 40}, cudf::type_id::INT8, std::nullopt, cudf::type_id::INT8);
+  auto stream        = space.acquire_stream();
+  auto const spilled = GENERATE(false, true);
+  if (spilled) {
+    auto const* host = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
+    auto writable    = batch->to_mutable();
+    writable.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), host, stream);
+    stream.sync();
+  }
+  sirius_physical_window window(
+    {logical_type::make(type_id::INTEGER), logical_type::make(type_id::HUGEINT)},
+    {logical_type::make(type_id::INTEGER), logical_type::make(type_id::INTEGER)},
+    1,
+    {0},
+    {{whole_partition_function::sum, 1}},
+    4);
+  pipelineable_operator_data input({batch});
+  input.prepare_for_processing(&space, stream);
+  auto result = window.execute(input, stream);
+  stream.sync();
+  auto batches = dynamic_cast<pipelineable_operator_data&>(*result).get_read_only_batches();
+  REQUIRE(batches.size() == 1);
+  auto table = sirius::get_cudf_table_view(batches[0]);
+  REQUIRE(table.num_columns() == 2);
+  CHECK(table.column(0).type().id() == cudf::type_id::INT8);
+  CHECK(table.column(1).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+  CHECK(copy_column_to_host<__int128_t>(table.column(1)) ==
+        std::vector<__int128_t>{40, 60, 40, 60});
+}
+
+TEST_CASE("window source drains assembled batches across repository partition gaps",
+          "[window_adapter][gpu]")
+{
+  using namespace sirius::op;
+  using namespace sirius::test::operator_utils;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto& space  = *manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  auto outputs = types;
+  outputs.push_back(sirius::from_duckdb(duckdb::LogicalType::HUGEINT));
+  sirius_physical_window window(outputs, types, 1, {0}, {{whole_partition_function::sum, 0}}, 3);
+  cucascade::shared_data_repository repo;
+  repo.set_num_partitions(5);
+  auto first  = make_numeric_batch<int32_t>(space, {1, 2}, cudf::type_id::INT32);
+  auto second = make_numeric_batch<int32_t>(space, {3}, cudf::type_id::INT32);
+  repo.add_data_batch(first, 1);
+  repo.add_data_batch(second, 4);
+  auto port  = std::make_unique<sirius_physical_operator::port>();
+  port->repo = &repo;
+  port->type = MemoryBarrierType::FULL;
+  window.add_port("default", std::move(port));
+  for (auto const& expected : {first, second}) {
+    auto input = window.get_next_task_input_data();
+    REQUIRE(input);
+    auto const& batches = dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches();
+    REQUIRE(batches.size() == 1);
+    CHECK(batches[0] == expected);
+  }
+  CHECK_FALSE(window.get_next_task_input_data());
+  CHECK(repo.total_size() == 0);
 }

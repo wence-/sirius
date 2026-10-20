@@ -28,7 +28,8 @@
 
 namespace duckdb {
 class LogicalWindow;
-}
+class LogicalOperator;
+}  // namespace duckdb
 
 namespace sirius::planner {
 
@@ -57,6 +58,10 @@ struct whole_partition_window_plan {
   std::vector<whole_partition_expression> expressions;
 };
 
+// Keep integer window results out of consumers that would apply the generic HUGEINT -> INT64
+// expression mapping. Passthrough references and ordering remain admitted.
+void validate_whole_partition_window_consumers(duckdb::LogicalOperator const& plan);
+
 // Requires resolved column references. Does not consume or modify the logical
 // plan. Throws NotImplementedException for unsupported combinations, even on
 // empty input. Hidden columns must survive through reduction/expansion and be
@@ -64,12 +69,20 @@ struct whole_partition_window_plan {
 whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window);
 
 // Build only prepared-input -> PARTITION -> CONCAT (concat_all = true). The result
-// exposes prepared_types, without SQL window results. SQL planning stays gated
-// until reduction/expansion implements the rest of the bound plan.
+// exposes prepared_types, without SQL window results. The executable WINDOW adapter
+// consumes these complete prepared buckets after pipeline wrapper insertion.
 duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_input(
   duckdb::unique_ptr<op::sirius_physical_operator> child,
   whole_partition_window_plan const& plan,
   std::size_t estimated_cardinality,
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
+
+// Insert only the exchange/assembly around an already prepared child. SQL lowering calls this
+// after compressed-schema propagation, alongside the other pipeline wrapper insertions.
+duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_exchange(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  std::vector<duckdb::idx_t> const& partition_slots,
+  std::size_t estimated_cardinality,
+  uint64_t hash_partition_bytes);
 
 }  // namespace sirius::planner

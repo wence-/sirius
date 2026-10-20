@@ -86,16 +86,15 @@ type, per-bucket ledger, or new cuCascade API is needed for this barrier.
 
 Implementation status: the planning slice lives in
 `src/planner/sirius_plan_window.{hpp,cpp}`. The `LogicalWindow` dispatcher calls
-the builder, which validates and prepares a planning IR, then deliberately throws
-`NotImplementedException` until slices 3–4 provide reduction and SQL activation. Ordinary SQL still
-uses the existing CPU fallback; no GPU window execution is enabled by this slice.
+the builder, which validates and prepares a planning IR. Slice 4 now lowers that IR to
+an executable WINDOW adapter. Unsupported bound semantics retain plan-time CPU fallback.
 
 The initial **planning** matrix is:
 
 | Item | Accepted |
 | --- | --- |
 | Functions | SUM and AVG with exactly one argument |
-| Argument types | Signed TINYINT/SMALLINT/INTEGER/BIGINT, FLOAT/DOUBLE, DECIMAL through precision 38 |
+| Argument types | Signed TINYINT/SMALLINT/INTEGER/BIGINT, FLOAT/DOUBLE, DECIMAL with precision 5 through 38 |
 | SUM result | Exact bound HUGEINT for signed integers, DOUBLE for floating arguments, DECIMAL(38, input scale) for decimals |
 | AVG result | Bound DOUBLE; decimal argument scale is retained |
 | Partition keys | BOOLEAN, signed integers through BIGINT, DATE, TIMESTAMP/TIMESTAMP_S/TIMESTAMP_MS/TIMESTAMP_NS, uncollated VARCHAR |
@@ -147,8 +146,9 @@ unsupported cases cannot reach execution, and result slots/types are correct.
 Implementation: `build_whole_partition_window_input()` constructs a prepared
 projection, a shared PARTITION router with explicit keys, and the generic
 `sirius_physical_concat` with `concat_all = true`. This input-stage builder
-returns the prepared schema, without SQL window results. SQL planning continues
-to throw until reduction/expansion is available.
+returns the prepared schema, without SQL window results. SQL activation uses the same
+preparation and exchange builders, inserting PARTITION/CONCAT after compressed-schema
+propagation alongside the existing pipeline wrappers.
 
 The planner supplies normalized key types and binds a byte-target sizing policy through the
 shared `partition_exchange`. Without keys it installs a fixed single-destination layout.
@@ -224,16 +224,13 @@ the non-null count and returns DOUBLE; all-null groups remain null. The interfac
 the stream and allocator contract, including the distinct hash table's current-resource
 requirement.
 
-SQL activation remains slice 4. In particular, that adapter must restore compressed
-argument types before calling the evaluator and preserve the explicit HUGEINT carrier;
-it must not use the existing generic HUGEINT-to-INT64 type mapping. It must also account
-for widened arguments, aggregate state, lookup scratch, the row-sized expansion map,
-and result columns alongside retained input. This slice does not introduce a new physical
-operator or modify partition/CONCAT ownership.
+SQL activation is provided by slice 4. The adapter restores compressed argument types
+before calling the evaluator and retains its explicit HUGEINT carrier. This evaluator
+slice itself does not own a physical operator or modify partition/CONCAT ownership.
 
-Validation: `sirius_library` and `sirius_unittest` build and link. The GPU selection
-`[window_evaluator],[window_plan],[window_input_plan]` passes **678 assertions in
-17 test cases**, including DuckDB comparisons for nullable composite keys, global
+Before SQL activation, `sirius_library` and `sirius_unittest` built and linked. The GPU
+selection `[window_evaluator],[window_plan],[window_input_plan]` recorded **678 assertions
+in 17 test cases**, including DuckDB comparisons for nullable composite keys, global
 windows and sliced inputs, wide integer sums, decimal scale/nulls/overflow, and
 existing input-stage checks. This establishes evaluator correctness for these
 cases, not SQL GPU window activation or a performance result.
@@ -257,6 +254,76 @@ Acceptance: exact row multiplicity, duplicate payloads, null keys, all-null valu
 empty input, admitted numeric boundaries, and several expressions on one group.
 
 ### 4. Activate and validate the SQL path
+
+Implementation: `src/op/sirius_physical_window.{hpp,cpp}` is a pipelineable adapter after
+the generic complete-bucket CONCAT. It restores evaluated key/argument carriers, calls
+the table evaluator, and publishes a view of original payload plus owned result columns.
+The output owner retains the input read lock and result table; hidden preparation columns
+are omitted. Its source acquisition drains assembled batches across every repository
+partition under the operator lock, skipping gaps and rechecking the FULL barrier. The base
+operator's partition-0-only pop cannot consume CONCAT's indexed multi-bucket publication.
+Empty upstream input terminates through the ordinary source protocol.
+`WINDOW` task deployment is observable through existing task telemetry and execute has
+its own NVTX range. Runtime task reporters now use the context's existing public event
+publisher, so subscribers can observe the real task deployments rather than a separate
+private event source. No window-specific repository, completion, or cancellation protocol
+is introduced.
+
+The cold-start estimate includes restored/widened values, per-group state, copied keys,
+hash lookup scratch, the row-to-group map, and expanded results. A known lower bound
+(input plus result data) rejects impossible working sets before reduction. Conservative
+estimates are admission hints rather than hard-fit proofs; remaining native OOM follows
+the existing bounded retry policy. A whole hash bucket must fit on one GPU, and an unkeyed
+window requires the entire input to fit. CONCAT retains its decoded-input and native
+row-count checks.
+
+DECIMAL arguments of precision 1–4 fall back: the generic Sirius mapping has no cuDF
+carrier for DuckDB's DECIMAL16 storage. The planning gate rejects them explicitly.
+DECIMAL128 inputs are exercised through Parquet and preceding GPU grouped SUMs; the existing
+DuckDB-native scan still declines stored DECIMAL128 columns before window execution.
+
+Integer SUM results remain DECIMAL128(scale=0) through payload forwarding and the result
+collector's conversion to DuckDB HUGEINT. Until generic expression consumers support an
+exact HUGEINT carrier, computed expressions/predicates over these integer SUM results
+fall back during planning. Bare projection, ordering and LIMIT remain admitted. Decimal
+SUM and DOUBLE AVG results can feed supported downstream expressions, including TPC-DS
+revenue ratios. With upstream ABS support, the deviation predicates in Q53/Q63/Q89
+also execute on GPU. Multiple logical window stages remain a
+plan-time fallback until Plan 2; the activation does not implicitly enable chained specifications.
+
+Differential SQL tests live in `test/cpp/integration/test_gpu_execution_window.cpp`.
+They check production task-deployment events as well as transparent execution/fallback
+counters; EXPLAIN alone does not establish activation. Original TPC-DS Q12/Q20/Q53/Q63/
+Q89/Q98 are probed both with Sirius's default optimizer mask and with `window_self_join`
+additionally disabled. The test preserves Sirius's required exclusions when changing that
+setting, so elimination of WINDOW is distinguishable from actual GPU window execution.
+
+SQL CLI validation on 2026-10-20: two RTX A6000 GPUs were available outside the sandbox;
+the SQL configuration uses one GPU, and the local build targets SM86. Original query text
+from `duckdb/extension/tpcds/dsdgen/queries/` runs against the committed SF 0.01 database.
+Both optimizer modes produced the following results:
+
+| Query | Rows | Result | Window evidence |
+| --- | --- | --- | --- |
+| Q12 | 14 | GPU execution; matches DuckDB | 3 WINDOW task deployments |
+| Q20 | 24 | GPU execution; matches DuckDB | 4 WINDOW task deployments |
+| Q98 | 24 | GPU execution; matches DuckDB | 4 WINDOW task deployments |
+| Q53 | 3 | GPU execution; matches DuckDB | 1 WINDOW task deployments |
+| Q63 | 10 | GPU execution; matches DuckDB | 1 WINDOW task deployments |
+| Q89 | 21 | GPU execution; matches DuckDB | 2 WINDOW task deployments |
+
+These are correctness runs on a small dataset, not performance measurements or full TPC-DS
+coverage. The activation regression suite separately requires production WINDOW task-deployment
+events on successful nonempty GPU paths.
+
+Final GPU validation after rebasing: the focused evaluator/planner/adapter/SQL, CONCAT,
+partition exchange, late-materialization, lifecycle, and publisher selection passes
+**119,815 assertions in 169 test cases**. The original TPC-DS probe passes
+**1,822 assertions in one generated test case**, covering all 12 query/mode combinations.
+All six queries deploy GPU WINDOW tasks in both optimizer modes, with zero CPU fallback. Formatting, lint, and test-registration
+hooks pass. Decimal precision-overflow tests retain the existing read-only CPU replay
+policy and verify that both GPU evaluation and DuckDB report overflow.
+
 
 Wire the operator through pipeline construction, memory estimation, telemetry,
 and ordinary publication. Add differential SQL tests and confirm actual GPU

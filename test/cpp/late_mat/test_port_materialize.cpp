@@ -402,6 +402,19 @@ TEST_CASE("a row-preserving replacement keeps the payload's identity", "[late_ma
     REQUIRE_THROWS_AS(with_null.with_batches_preserving_rows({batch(), nullptr}),
                       std::invalid_argument);
   }
+  SECTION("routed")
+  {
+    sirius::op::routed_operator_data payload({original}, {3});
+    payload.set_preferred_device_id(0);
+    auto const restored = payload.with_batches_preserving_rows({batch()});
+    auto const* routed  = dynamic_cast<sirius::op::routed_operator_data const*>(restored.get());
+    REQUIRE(routed != nullptr);
+    REQUIRE(routed->destinations() == std::vector<std::size_t>{3});
+    REQUIRE(routed->original_batch_ids() == std::vector<std::uint64_t>{original_id});
+    REQUIRE(routed->get_preferred_device_id() == 0);
+    auto const again = restored->with_batches_preserving_rows({batch()});
+    REQUIRE(again->original_batch_ids() == std::vector<std::uint64_t>{original_id});
+  }
   SECTION("partitioned")
   {
     partitioned_operator_data payload(

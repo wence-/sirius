@@ -25,6 +25,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
 #include <stdexcept>
@@ -215,6 +216,30 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
     auto& arg = arguments[i];
     arg.widened.reset();
     arg.sum = checked_sum(std::move(results[i].results[0]), stream, mr);
+    // DuckDB DECIMAL(38, scale) has a stricter bound than the signed 128-bit carrier.
+    // AVG's internal sum need not fit DECIMAL(38), but a requested decimal SUM must.
+    auto const decimal_sum =
+      cudf::is_fixed_point(input.column(arg.column).type()) &&
+      std::any_of(aggregates.begin(), aggregates.end(), [&](auto const& aggregate) {
+        return aggregate.argument_column == arg.column &&
+               aggregate.function == whole_partition_function::sum;
+      });
+    if (decimal_sum) {
+      __int128_t limit = 1;
+      for (int digit = 0; digit < 38; ++digit) {
+        limit *= 10;
+      }
+      auto bounds = cudf::minmax(arg.sum->view(), stream, mr);
+      for (auto const* bound : {bounds.first.get(), bounds.second.get()}) {
+        if (bound->is_valid(stream)) {
+          auto const value =
+            static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(*bound).value(stream);
+          if (value <= -limit || value >= limit) {
+            throw std::overflow_error("Whole-partition window sum exceeds DECIMAL(38)");
+          }
+        }
+      }
+    }
     if (arg.needs_avg) {
       auto sum   = cudf::cast(arg.sum->view(), f64, stream, mr);
       auto count = cudf::cast(results[i].results[1]->view(), f64, stream, mr);

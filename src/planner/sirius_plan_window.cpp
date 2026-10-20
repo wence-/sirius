@@ -21,6 +21,8 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/reference.hpp"
@@ -29,6 +31,7 @@
 #include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_window.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
@@ -52,8 +55,10 @@ bool numeric_argument(duckdb::LogicalType const& type)
     case LogicalTypeId::INTEGER:
     case LogicalTypeId::BIGINT:
     case LogicalTypeId::FLOAT:
-    case LogicalTypeId::DOUBLE:
-    case LogicalTypeId::DECIMAL: return true;
+    case LogicalTypeId::DOUBLE: return true;
+    case LogicalTypeId::DECIMAL:
+      return duckdb::DecimalType::GetWidth(type) >
+             sirius::logical_type::decimal_max_precision_int16;
     default: return false;
   }
 }
@@ -109,7 +114,9 @@ whole_partition_function validate(duckdb::BoundWindowExpression const& expressio
   if (name == "avg" && expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
     return whole_partition_function::avg;
   }
-  if (name == "sum") {
+  // Statistics propagation replaces SUM with this internal implementation while retaining
+  // the exact bound result type. We still evaluate it using checked, widened accumulation.
+  if (name == "sum" || name == "sum_no_overflow") {
     duckdb::LogicalType expected = duckdb::LogicalType::HUGEINT;
     if (argument.id() == duckdb::LogicalTypeId::DECIMAL) {
       expected = duckdb::LogicalType::DECIMAL(38, duckdb::DecimalType::GetScale(argument));
@@ -123,6 +130,53 @@ whole_partition_function validate(duckdb::BoundWindowExpression const& expressio
 }
 
 }  // namespace
+
+namespace {
+
+bool validate_consumers(duckdb::LogicalOperator const& plan, std::size_t& window_stages)
+{
+  bool has_integer_window = false;
+  for (auto const& child : plan.children) {
+    has_integer_window |= validate_consumers(*child, window_stages);
+  }
+  if (has_integer_window) {
+    duckdb::LogicalOperatorVisitor::EnumerateExpressions(plan, [&](auto const* expression) {
+      if (!*expression) { return; }
+      auto const forwards_reference =
+        plan.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
+        plan.type == duckdb::LogicalOperatorType::LOGICAL_ORDER_BY ||
+        plan.type == duckdb::LogicalOperatorType::LOGICAL_TOP_N;
+      if (forwards_reference &&
+          (*expression)->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+        return;
+      }
+      auto visit = [](auto&& self, duckdb::Expression const& expr) -> void {
+        if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+            expr.GetReturnType() == duckdb::LogicalType::HUGEINT) {
+          decline("expressions over integer SUM results require an exact HUGEINT consumer");
+        }
+        duckdb::ExpressionIterator::EnumerateChildren(
+          expr, [&](duckdb::Expression const& child) { self(self, child); });
+      };
+      visit(visit, **expression);
+    });
+  }
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_WINDOW) {
+    if (++window_stages > 1) { decline("multiple window stages require Plan 2"); }
+    for (auto const& expression : plan.expressions) {
+      has_integer_window |= expression->GetReturnType() == duckdb::LogicalType::HUGEINT;
+    }
+  }
+  return has_integer_window;
+}
+
+}  // namespace
+
+void validate_whole_partition_window_consumers(duckdb::LogicalOperator const& plan)
+{
+  std::size_t window_stages = 0;
+  (void)validate_consumers(plan, window_stages);
+}
 
 whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow const& window)
 {
@@ -202,15 +256,13 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
   return plan;
 }
 
-duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_input(
+namespace {
+
+duckdb::unique_ptr<op::sirius_physical_operator> prepare_whole_partition_window_input(
   duckdb::unique_ptr<op::sirius_physical_operator> child,
   whole_partition_window_plan const& plan,
-  std::size_t estimated_cardinality,
-  uint64_t hash_partition_bytes)
+  std::size_t estimated_cardinality)
 {
-  if (hash_partition_bytes == 0) {
-    throw std::invalid_argument("Partition byte target must be positive");
-  }
   if (!child || child->types.size() != plan.input_width ||
       plan.prepared_types.size() != plan.input_width + plan.hidden_expressions.size()) {
     throw duckdb::InternalException("Window preparation schema does not match its child");
@@ -227,10 +279,37 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_in
   for (auto const& expression : plan.hidden_expressions) {
     select.push_back(ast::clone(*expression));
   }
-  child = push_projection(std::move(child), prepared, std::move(select), estimated_cardinality);
+  return push_projection(std::move(child), prepared, std::move(select), estimated_cardinality);
+}
+
+}  // namespace
+
+duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_input(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  whole_partition_window_plan const& plan,
+  std::size_t estimated_cardinality,
+  uint64_t hash_partition_bytes)
+{
+  child = prepare_whole_partition_window_input(std::move(child), plan, estimated_cardinality);
+  return build_whole_partition_window_exchange(
+    std::move(child), plan.partition_slots, estimated_cardinality, hash_partition_bytes);
+}
+
+duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_exchange(
+  duckdb::unique_ptr<op::sirius_physical_operator> child,
+  std::vector<duckdb::idx_t> const& partition_slots,
+  std::size_t estimated_cardinality,
+  uint64_t hash_partition_bytes)
+{
+  if (!child) { throw std::invalid_argument("Window exchange requires a prepared child"); }
+  auto const prepared = child->types;
+  if (hash_partition_bytes == 0) {
+    throw std::invalid_argument("Partition byte target must be positive");
+  }
   std::vector<int> keys;
-  for (auto slot : plan.partition_slots) {
-    if (slot > static_cast<duckdb::idx_t>(std::numeric_limits<int>::max())) {
+  for (auto slot : partition_slots) {
+    if (slot >= prepared.size() ||
+        slot > static_cast<duckdb::idx_t>(std::numeric_limits<int>::max())) {
       throw duckdb::NotImplementedException("Window partition slot exceeds the native index range");
     }
     keys.push_back(static_cast<int>(slot));
@@ -240,12 +319,12 @@ duckdb::unique_ptr<op::sirius_physical_operator> build_whole_partition_window_in
   op::partition_spec spec;
   spec.mode = keys.empty() ? op::partition_mode::single : op::partition_mode::hash;
   for (auto key : keys) {
-    spec.key_cast_types.push_back(sirius::get_cudf_type(prepared[key]));
+    spec.key_cast_types.push_back(sirius::require_cudf_type(prepared[key]));
   }
   spec.key_columns = std::move(keys);
   auto exchange    = duckdb::make_uniq<op::sirius_physical_partition>(
     prepared, estimated_cardinality, std::move(spec), op::MemoryBarrierType::FULL);
-  if (plan.partition_slots.empty()) {
+  if (partition_slots.empty()) {
     exchange->set_fixed_layout({op::partition_mode::single, op::partition_placement::unpinned(1)});
   } else {
     op::partition_exchange::bind(
@@ -267,12 +346,25 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator:
   duckdb::LogicalWindow& window)
 {
   auto bound_plan = plan_whole_partition_window(window);
-  // The input builder now implements complete-bucket assembly, but its schema
-  // contains prepared input columns, not SQL results. Keep plan-time fallback
-  // until reduction/expansion upholds the bound output/type contracts.
-  throw duckdb::NotImplementedException(
-    "Whole-partition window execution is not implemented (%llu expressions planned)",
-    static_cast<unsigned long long>(bound_plan.expressions.size()));
+  auto child      = prepare_whole_partition_window_input(
+    create_plan(*window.children[0]), bound_plan, window.estimated_cardinality);
+  auto prepared = sirius::from_duckdb_vec(bound_plan.prepared_types);
+  std::vector<cudf::size_type> keys(bound_plan.partition_slots.begin(),
+                                    bound_plan.partition_slots.end());
+  std::vector<op::whole_partition_aggregate> aggregates;
+  for (auto const& expression : bound_plan.expressions) {
+    aggregates.push_back(
+      {expression.function, static_cast<cudf::size_type>(expression.argument_slot)});
+  }
+  auto result =
+    duckdb::make_uniq<op::sirius_physical_window>(sirius::from_duckdb_vec(bound_plan.output_types),
+                                                  std::move(prepared),
+                                                  bound_plan.input_width,
+                                                  std::move(keys),
+                                                  std::move(aggregates),
+                                                  window.estimated_cardinality);
+  result->children.push_back(std::move(child));
+  return result;
 }
 
 }  // namespace sirius::planner

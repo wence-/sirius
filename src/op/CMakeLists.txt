@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
-  PRIVATE window/whole_partition.cpp
+  PRIVATE sirius_physical_window.cpp
+          window/whole_partition.cpp
           aggregate/aggregate_op_util.cpp
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp

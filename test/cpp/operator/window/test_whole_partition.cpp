@@ -313,8 +313,13 @@ TEST_CASE("whole-partition evaluator reports decimal accumulator overflow",
     limit *= 10;
   }
   --limit;
+  auto const carrier_overflow = GENERATE(false, true);
+  // Two half-limits cross DECIMAL(38)'s precision bound without overflowing int128.
+  auto const negative  = GENERATE(false, true);
+  auto const magnitude = carrier_overflow ? limit : limit / 2 + 1;
+  auto const value     = negative ? -magnitude : magnitude;
   auto input =
-    column<__int128_t>({limit, limit}, cudf::data_type{cudf::type_id::DECIMAL128, 0}, stream, mr);
+    column<__int128_t>({value, value}, cudf::data_type{cudf::type_id::DECIMAL128, 0}, stream, mr);
   auto const keyed = GENERATE(false, true);
   auto keys        = column<int32_t>({0, 0}, cudf::data_type{cudf::type_id::INT32}, stream, mr);
   CHECK_THROWS_AS(evaluate_whole_partition_window(
