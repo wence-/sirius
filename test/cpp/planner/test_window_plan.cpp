@@ -178,9 +178,6 @@ TEST_CASE("whole-partition window planning rejects unsupported bound semantics",
     "sum(DISTINCT v) OVER ()",
     "sum(v) FILTER (WHERE v > 0) OVER ()",
     "sum(v ORDER BY p) OVER ()",
-    "count(*) OVER ()",
-    "min(v) OVER ()",
-    "max(v) OVER ()",
     "row_number() OVER ()",
     "rank() OVER (ORDER BY p)",
     "lag(v) OVER ()",
@@ -200,6 +197,25 @@ TEST_CASE("whole-partition window planning rejects unsupported bound semantics",
   auto logical = fixture.bind(std::string("SELECT ") + expression + " FROM w");
   REQUIRE_THROWS_AS(plan_whole_partition_window(find_window(*logical)),
                     duckdb::NotImplementedException);
+}
+
+TEST_CASE("whole-partition count and extrema preserve bound result types", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto logical = fixture.bind(
+    "SELECT count(*) OVER (PARTITION BY p),count(v) OVER (PARTITION BY p),"
+    "min(v) OVER (PARTITION BY p),max(d) OVER (PARTITION BY p),"
+    "min(s) OVER (PARTITION BY p) FROM w");
+  auto plan = plan_whole_partition_window(find_window(*logical));
+  REQUIRE(plan.expressions.size() == 5);
+  CHECK(plan.expressions[0].function == whole_partition_function::count_all);
+  CHECK(plan.expressions[1].function == whole_partition_function::count);
+  CHECK(plan.expressions[0].result_type == duckdb::LogicalType::BIGINT);
+  CHECK(plan.expressions[1].result_type == duckdb::LogicalType::BIGINT);
+  CHECK(plan.expressions[2].result_type == duckdb::LogicalType::INTEGER);
+  CHECK(plan.expressions[3].result_type == duckdb::LogicalType::DECIMAL(18, 2));
+  CHECK(plan.expressions[4].result_type == duckdb::LogicalType::VARCHAR);
+  CHECK(plan.prepared_types[plan.expressions[0].argument_slot] == duckdb::LogicalType::INTEGER);
 }
 
 TEST_CASE("whole-partition window planning retains decimal widening", "[planner][window_plan]")

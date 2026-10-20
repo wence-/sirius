@@ -3,7 +3,7 @@
 ## Scope and execution contract
 
 Deliver a narrow end-to-end GPU implementation of whole-partition SUM and AVG,
-then COUNT/MIN/MAX as small follow-ups. Start with partition-only specifications,
+with COUNT/MIN/MAX implemented as follow-ups on the same reduction/expansion path. Start with partition-only specifications,
 including no partition keys. An explicit whole frame with ORDER BY can be admitted
 later when bound-semantic validation proves that order does not affect the admitted
 aggregate and modifiers. An ordered default frame must not be treated as whole.
@@ -93,7 +93,7 @@ The initial **planning** matrix is:
 
 | Item | Accepted |
 | --- | --- |
-| Functions | SUM and AVG with exactly one argument |
+| Functions | SUM, AVG, COUNT, MIN and MAX with one argument; COUNT(*) with no argument |
 | Argument types | Signed TINYINT/SMALLINT/INTEGER/BIGINT, FLOAT/DOUBLE, DECIMAL with precision 5 through 38 |
 | SUM result | Exact bound HUGEINT for signed integers, DOUBLE for floating arguments, DECIMAL(38, input scale) for decimals |
 | AVG result | Bound DOUBLE; decimal argument scale is retained |
@@ -102,9 +102,9 @@ The initial **planning** matrix is:
 | Multiple expressions | Equivalent partition keys, including different key order; result order follows the logical window expression order |
 
 Ordered frames (even explicitly whole), current-row ROWS frames, DISTINCT,
-FILTER, EXCLUDE, argument ordering, IGNORE NULLS, non-SUM/AVG functions,
+FILTER, EXCLUDE, argument ordering, IGNORE NULLS, functions outside this matrix,
 unsupported types, volatile expressions, and untranslatable key/argument
-expressions are rejected during planning. COUNT/MIN/MAX remain follow-ups.
+expressions are rejected during planning. COUNT/MIN/MAX share the existing complete-bucket evaluator.
 DuckDB may bind a SQL argument through a cast; the matrix applies to the bound
 argument, after that cast.
 
@@ -335,9 +335,33 @@ Probe the optimized TPC-DS whole-frame examples to determine which still contain
 windows. Do not require the full benchmark suite to enable a correctly bounded
 isolated feature, or claim full-query support from operator tests.
 
+### COUNT/MIN/MAX follow-up
+
+COUNT(expr), COUNT(*), MIN and MAX use the same whole-partition capability gate,
+complete-bucket assembly, and null-safe row expansion as SUM/AVG. Grouped requests
+are submitted together; unkeyed requests use scalar reduction and broadcast.
+COUNT is widened to BIGINT, including zero for all-null arguments. MIN/MAX retain
+the argument type and return null for all-null groups. Floating extrema explicitly
+match DuckDB: NaNs sort above all other values, MIN returns a non-NaN when one exists,
+and MAX returns NaN if any non-null NaN is present. Neither evaluates an
+unrequested SUM, so counting or finding extrema cannot raise a SUM overflow.
+
+COUNT(*) prepares a shared hidden non-null constant, retaining input cardinality
+when every original payload column has been pruned. Variable-width extrema use
+string offsets as the adapter's output-size lower bound; character storage remains
+subject to normal allocation and bounded OOM handling. DISTINCT, FILTER, ordered
+frames and multiple window stages retain their existing planning restrictions.
+
+Validation: the rebuilt library and test binary pass **243,794 assertions in 31 test
+cases** for `[window_evaluator],[window_plan],[window_adapter],[window_input_plan],
+[window_sql],[window_tpcds]`. Coverage includes null/NaN groups, empty input,
+COUNT-only plans with pruned payload, strings/dates/booleans/decimals, fragmented
+multi-bucket input, and all six original TPC-DS probes in both optimizer modes.
+Formatting, lint and test-registration checks pass.
+
 ## Completion and exclusions
 
-Complete when admitted whole-partition SQL windows execute correctly on GPU with
+Complete when admitted whole-partition SUM/AVG/COUNT/MIN/MAX SQL windows execute correctly on GPU with
 complete-bucket assembly and verified row association. Report the supported type
 matrix and whole-bucket-fit restriction. Ranking, cumulative frames, permutations,
 cross-batch summaries, and new repository ordering semantics are not prerequisites.

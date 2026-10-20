@@ -22,6 +22,8 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/utilities/traits.hpp>
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -111,9 +113,13 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
     // admission hints: never reject a bucket merely because a conservative estimate exceeds RAM.
     std::size_t result_width = 0;
     for (std::size_t i = _input_width; i < types.size(); ++i) {
-      result_width = memory::saturating_add(
-        result_width,
-        types[i].id() == type_id::HUGEINT ? 16 : cudf::size_of(require_cudf_type(types[i])));
+      auto const type = require_cudf_type(types[i]);
+      // String extrema retain variable-width values. Offsets alone are a safe lower bound;
+      // their character storage and scratch still use ordinary allocation/OOM accounting.
+      auto const width = types[i].id() == type_id::HUGEINT ? 16
+                         : cudf::is_fixed_width(type)      ? cudf::size_of(type)
+                                                           : sizeof(cudf::size_type);
+      result_width     = memory::saturating_add(result_width, width);
     }
     auto const input_bytes = batch.get_data()->get_size_in_bytes();
     auto const required    = memory::saturating_add(

@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/aggregate_function.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -87,7 +88,7 @@ whole_partition_function validate(duckdb::BoundWindowExpression const& expressio
   using duckdb::WindowBoundary;
   if (expression.GetExpressionType() != duckdb::ExpressionType::WINDOW_AGGREGATE ||
       !expression.AggregateFunction()) {
-    decline("only SUM and AVG aggregates are planned");
+    decline("only SUM, AVG, COUNT, MIN and MAX aggregates are planned");
   }
   if (expression.Distinct()) { decline("DISTINCT"); }
   if (expression.Filter()) { decline("FILTER"); }
@@ -105,12 +106,27 @@ whole_partition_function validate(duckdb::BoundWindowExpression const& expressio
        expression.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE)) {
     decline("frame does not cover the whole partition");
   }
+  auto const& name = expression.AggregateFunction()->GetName().GetIdentifierName();
+  if ((name == "count_star" || name == "count") && expression.GetChildren().empty() &&
+      expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
+    return whole_partition_function::count_all;
+  }
+  if (expression.GetChildren().size() == 1) {
+    auto const& argument = expression.GetChildren()[0]->GetReturnType();
+    bool const scalar    = numeric_argument(argument) || partition_key(argument);
+    if (scalar && name == "count" && expression.GetReturnType() == duckdb::LogicalType::BIGINT) {
+      return whole_partition_function::count;
+    }
+    if (scalar && expression.GetReturnType() == argument) {
+      if (name == "min") { return whole_partition_function::min; }
+      if (name == "max") { return whole_partition_function::max; }
+    }
+  }
   if (expression.GetChildren().size() != 1 ||
       !numeric_argument(expression.GetChildren()[0]->GetReturnType())) {
     decline("aggregate argument type or arity");
   }
   auto const& argument = expression.GetChildren()[0]->GetReturnType();
-  auto const& name     = expression.AggregateFunction()->GetName().GetIdentifierName();
   if (name == "avg" && expression.GetReturnType() == duckdb::LogicalType::DOUBLE) {
     return whole_partition_function::avg;
   }
@@ -196,6 +212,9 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
 
   // Compare bound expressions before translation. Reuse references directly and
   // evaluate each deterministic hidden expression once for the entire stage.
+  // A constant argument preserves row cardinality even when COUNT(*) is the only consumer
+  // and DuckDB prunes every original input column. It is hidden from the SQL output.
+  duckdb::BoundConstantExpression count_all_argument(duckdb::Value::INTEGER(1));
   std::vector<duckdb::Expression const*> hidden;
   auto prepare = [&](duckdb::Expression const& expression) -> duckdb::idx_t {
     if (expression.IsVolatile()) { decline("volatile key or argument"); }
@@ -245,9 +264,12 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
     if (window.types[output_slot] != expression.GetReturnType()) {
       decline("result column mapping");
     }
+    auto const& argument = function == whole_partition_function::count_all
+                             ? static_cast<duckdb::Expression const&>(count_all_argument)
+                             : *expression.GetChildren()[0];
     plan.expressions.push_back({function,
-                                prepare(*expression.GetChildren()[0]),
-                                expression.GetChildren()[0]->GetReturnType(),
+                                prepare(argument),
+                                argument.GetReturnType(),
                                 expression.GetReturnType(),
                                 expression.WindowStart(),
                                 expression.WindowEnd(),

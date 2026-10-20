@@ -27,10 +27,11 @@
 
 namespace sirius::op {
 
-enum class whole_partition_function { sum, avg };
+enum class whole_partition_function { sum, avg, count, count_all, min, max };
 
 struct whole_partition_aggregate {
   whole_partition_function function;
+  // COUNT(*) uses a prepared non-null constant slot, so every request has an argument.
   cudf::size_type argument_column;
 };
 
@@ -45,6 +46,8 @@ struct whole_partition_aggregate {
 /// Signed integer SUM uses DECIMAL128(scale=0) as its exact HUGEINT carrier; decimal
 /// SUM uses DECIMAL128 at the input scale. Floating SUM and all AVG results are DOUBLE.
 /// Integer/decimal arguments are widened before summation; overflow throws.
+/// COUNT returns INT64 (zero for all-null arguments); MIN/MAX retain the argument type
+/// and return null for all-null partitions. COUNT(*) includes null rows.
 /// An empty input returns typed empty result columns, including for an unkeyed window.
 ///
 /// No repository, physical operator, or DuckDB planner state is used here. All work is

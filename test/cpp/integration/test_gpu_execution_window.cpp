@@ -86,6 +86,7 @@ class WindowFixture : public sirius::test::GpuExecutionFixture {
                       std::size_t minimum_tasks           = 1,
                       std::set<size_t> const& approximate = {})
   {
+    INFO(sql);
     run_ok("SET gpu_execution=false");
     auto plan = con->Query("EXPLAIN " + sql);
     REQUIRE_FALSE(plan->HasError());
@@ -124,6 +125,54 @@ TEST_CASE_METHOD(WindowFixture,
   compare_window(
     "SELECT id,sum(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
     "FROM w");
+}
+
+TEST_CASE_METHOD(WindowFixture,
+                 "whole-partition count and extrema execute on GPU",
+                 "[integration][gpu_execution][window_sql]")
+{
+  compare_window(
+    "SELECT id,p,q,count(*) OVER (PARTITION BY p,q),count(v) OVER (PARTITION BY q,p),"
+    "min(v) OVER (PARTITION BY p,q),max(v) OVER (PARTITION BY p,q),"
+    "sum(v) OVER (PARTITION BY p,q),avg(v) OVER (PARTITION BY p,q) FROM w",
+    2,
+    {8});
+  compare_window(
+    "SELECT id,count(s) OVER (PARTITION BY p),min(s) OVER (PARTITION BY p),"
+    "max(s) OVER (PARTITION BY p),min(d) OVER (PARTITION BY p),"
+    "max(f) OVER (PARTITION BY p) FROM w");
+  compare_window(
+    "SELECT id,count(*) OVER (),count(v) OVER (),min(v) OVER (),max(v) OVER () FROM w");
+  compare_window(
+    "SELECT id,min(x) OVER (PARTITION BY p),max(x) OVER (PARTITION BY p),"
+    "min(x) OVER (PARTITION BY p) FROM "
+    "(SELECT id,p,CASE WHEN p=0 THEN 'NaN'::DOUBLE WHEN p=1 THEN NULL::DOUBLE "
+    "WHEN id%5=0 THEN 'NaN'::DOUBLE ELSE f END x FROM w) t");
+  compare_window(
+    "SELECT id,min(x) OVER (),max(x) OVER (),count(x) OVER () FROM "
+    "(SELECT id,CASE WHEN id%5=0 THEN 'NaN'::FLOAT ELSE f::FLOAT END x FROM w) t");
+  compare_window("SELECT id,count(s) OVER (),min(s) OVER (),max(s) OVER () FROM w");
+  // No payload columns remain, and COUNT(*) must still count the complete input.
+  compare_window("SELECT count(*) OVER () FROM w");
+  compare_window("SELECT count(*) OVER (PARTITION BY p) FROM w", 2);
+  compare_window(
+    "SELECT id,count(NULL::INTEGER) OVER (PARTITION BY p),"
+    "min(NULL::INTEGER) OVER (PARTITION BY p),max(NULL::INTEGER) OVER (PARTITION BY p) FROM w");
+  compare_window(
+    "SELECT id,count(v) OVER (PARTITION BY p,q),min(v) OVER (PARTITION BY p,q),"
+    "max(v) OVER (PARTITION BY p,q) FROM (SELECT * FROM w UNION ALL SELECT * FROM w) t",
+    2);
+  run_ok("CREATE TABLE window_types(id INTEGER,q INTEGER,d DATE,b BOOLEAN)");
+  run_ok(
+    "INSERT INTO window_types VALUES (0,0,DATE '2000-01-01',true),"
+    "(1,0,DATE '1999-01-01',false),(2,NULL,NULL,NULL),(3,NULL,DATE '2001-01-01',NULL)");
+  run_ok("CHECKPOINT");
+  compare_window(
+    "SELECT id,q,min(d) OVER (PARTITION BY q),max(d) OVER (PARTITION BY q),"
+    "min(b) OVER (PARTITION BY q),max(b) OVER (PARTITION BY q),"
+    "count(d) OVER (PARTITION BY q) FROM window_types");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) OVER (),count(v) OVER (),min(v) OVER (),max(v) OVER () FROM w WHERE id<0");
 }
 
 TEST_CASE_METHOD(WindowFixture,
@@ -176,6 +225,7 @@ TEST_CASE_METHOD(WindowFixture,
   run_ok("COPY overflow_values TO " + files.file_literal("overflow.parquet") + " (FORMAT PARQUET)");
   run_ok("CREATE VIEW overflow_p AS SELECT * FROM read_parquet(" +
          files.file_literal("overflow.parquet") + ")");
+  compare_window("SELECT v,count(v) OVER (),min(v) OVER (),max(v) OVER () FROM overflow_p");
   // AVG may use a sum beyond DECIMAL(38), provided its 128-bit accumulator still fits.
   compare_window("SELECT v,avg(v) OVER () FROM overflow_p", 1, {1});
   auto const sql = "SELECT sum(v) OVER () FROM overflow_p";
@@ -225,7 +275,7 @@ TEST_CASE_METHOD(WindowFixture,
 {
   expect_plan_fallback_matches_cpu("SELECT id,sum(v) OVER (ORDER BY id) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");
-  expect_plan_fallback_matches_cpu("SELECT id,count(*) OVER () FROM w");
+  expect_plan_fallback_matches_cpu("SELECT id,count(DISTINCT v) OVER () FROM w");
   expect_plan_fallback_matches_cpu("SELECT sum(v::DECIMAL(4,0)) OVER () FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT sum(s) OVER (PARTITION BY p) FROM "

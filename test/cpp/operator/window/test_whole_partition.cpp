@@ -291,15 +291,32 @@ TEST_CASE("whole-partition evaluator returns typed empties and nulls for all-nul
   auto result = evaluate_whole_partition_window(
     cudf::table_view{{input->view()}},
     keyed ? std::vector<cudf::size_type>{0} : std::vector<cudf::size_type>{},
-    {{function::sum, 0}, {function::avg, 0}},
+    {{function::sum, 0},
+     {function::avg, 0},
+     {function::count, 0},
+     {function::count_all, 0},
+     {function::min, 0},
+     {function::max, 0}},
     stream,
     mr);
   REQUIRE(result->num_rows() == (empty ? 0 : 3));
-  REQUIRE(result->num_columns() == 2);
+  REQUIRE(result->num_columns() == 6);
   CHECK(result->get_column(0).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
   CHECK(result->get_column(1).type() == cudf::data_type{cudf::type_id::FLOAT64});
   CHECK(result->get_column(0).null_count() == result->num_rows());
   CHECK(result->get_column(1).null_count() == result->num_rows());
+  for (auto i : {2, 3}) {
+    CHECK(result->get_column(i).type() == cudf::data_type{cudf::type_id::INT64});
+    CHECK(result->get_column(i).null_count() == 0);
+  }
+  CHECK(host<int64_t>(result->view().column(2), stream) ==
+        std::vector<int64_t>(result->num_rows(), 0));
+  CHECK(host<int64_t>(result->view().column(3), stream) ==
+        std::vector<int64_t>(result->num_rows(), 3));
+  for (auto i : {4, 5}) {
+    CHECK(result->get_column(i).type() == input->type());
+    CHECK(result->get_column(i).null_count() == result->num_rows());
+  }
 }
 
 TEST_CASE("whole-partition evaluator reports decimal accumulator overflow",
