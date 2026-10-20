@@ -20,6 +20,7 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/window/whole_partition.hpp"
 #include "sirius_config.hpp"
 
 #include <memory>
@@ -31,7 +32,7 @@ class LogicalWindow;
 
 namespace sirius::planner {
 
-enum class whole_partition_function { sum, avg };
+using op::whole_partition_function;
 
 struct whole_partition_expression {
   whole_partition_function function;

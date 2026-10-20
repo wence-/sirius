@@ -1,9 +1,10 @@
 # SQL window implementation plans
 
-Status: Plan 1 has bound planning (slice 1) and complete-bucket input assembly
-(slice 2), with SQL execution still gated on CPU fallback. Reduction and activation
-remain proposed. No end-to-end GPU window validation or performance result is
-implied. These plans supersede the implementation route
+Status: Plan 1 has bound planning (slice 1), complete-bucket input assembly
+(slice 2), and a standalone groupby-plus-join reduction/expansion evaluator (slice 3).
+SQL execution remains gated on CPU fallback; physical-operator integration and activation
+are slice 4. No end-to-end GPU window validation or performance result is implied.
+These plans supersede the implementation route
 in the older `wence/fea/window-functions` branch. Do not import its ordering
 directory, placement, bounded-merge, or continuation machinery as prerequisites.
 

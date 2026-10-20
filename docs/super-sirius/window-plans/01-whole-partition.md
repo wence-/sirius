@@ -204,6 +204,40 @@ Barrier-specific acceptance:
 
 ### 3. Reduction and expansion
 
+Implementation: `src/op/window/whole_partition.{hpp,cpp}` provides a table evaluator,
+independent of repositories, physical operators, and the DuckDB planning IR. It accepts a
+read-only, type-normalized prepared bucket and returns only the requested result columns,
+in request order and aligned with the original input rows. The caller retains payload,
+appends these results, and drops hidden preparation columns.
+
+The baseline batches SUM and non-null COUNT requests by argument column in one groupby,
+including null partition keys. A null-safe `distinct_hash_join` against the unique group
+keys supplies one aggregate-row index per input row; one gather expands all results.
+No explicit key sort, payload reordering, or inverse permutation is required. Without
+keys, scalar reductions and broadcast avoid both groupby and join.
+
+Arguments are widened before summation: signed integers use DECIMAL128(scale 0) as an
+exact HUGEINT carrier, decimal arguments use DECIMAL128 at their logical scale, and
+floating arguments use DOUBLE. Integer/decimal summation uses checked native aggregation;
+overflow throws rather than publishing wrapped values. AVG divides the widened sum by
+the non-null count and returns DOUBLE; all-null groups remain null. The interface documents
+the stream and allocator contract, including the distinct hash table's current-resource
+requirement.
+
+SQL activation remains slice 4. In particular, that adapter must restore compressed
+argument types before calling the evaluator and preserve the explicit HUGEINT carrier;
+it must not use the existing generic HUGEINT-to-INT64 type mapping. It must also account
+for widened arguments, aggregate state, lookup scratch, the row-sized expansion map,
+and result columns alongside retained input. This slice does not introduce a new physical
+operator or modify partition/CONCAT ownership.
+
+Validation: `sirius_library` and `sirius_unittest` build and link. The GPU selection
+`[window_evaluator],[window_plan],[window_input_plan]` passes **678 assertions in
+17 test cases**, including DuckDB comparisons for nullable composite keys, global
+windows and sliced inputs, wide integer sums, decimal scale/nulls/overflow, and
+existing input-stage checks. This establishes evaluator correctness for these
+cases, not SQL GPU window activation or a performance result.
+
 Use cuDF/Sirius aggregation primitives where their semantics match the admitted
 matrix. Key grouping must include nulls and distinguish collisions by actual key
 equality. Expand each group result to every original row through a row-to-group
@@ -216,7 +250,8 @@ equivalent implementation, with correct validity and output type. Do not reuse
 an aggregation wrapper that discards payload or changes row association.
 
 Keep table input/output and SQL partition metadata separate from repository/task
-ownership. Evaluation appends columns; all retained input columns stay aligned.
+ownership. The physical adapter appends the evaluator's result columns; all retained
+input columns must stay aligned.
 
 Acceptance: exact row multiplicity, duplicate payloads, null keys, all-null values,
 empty input, admitted numeric boundaries, and several expressions on one group.
