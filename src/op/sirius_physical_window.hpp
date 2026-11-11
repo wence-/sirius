@@ -20,6 +20,8 @@
 #include "op/window/ranking.hpp"
 #include "op/window/whole_partition.hpp"
 
+#include <optional>
+
 namespace sirius::op {
 
 /**
@@ -48,12 +50,12 @@ class sirius_physical_window : public sirius_physical_operator {
     return sirius::OrderPreservationType::NO_ORDER;
   }
 
-  /// A window of aggregates over the whole partition.
+  /// A window of aggregates over the whole partition, evaluated by @p plan. The plan's group
+  /// columns are the partition columns.
   sirius_physical_window(duckdb::vector<logical_type> output_types,
                          duckdb::vector<logical_type> prepared_types,
                          std::size_t input_width,
-                         std::vector<cudf::size_type> partition_columns,
-                         std::vector<whole_partition_aggregate> aggregates,
+                         whole_partition_plan plan,
                          std::size_t estimated_cardinality);
 
   /// A window of ranking functions over the window ORDER BY.
@@ -80,7 +82,8 @@ class sirius_physical_window : public sirius_physical_operator {
   duckdb::vector<logical_type> _prepared_types;
   std::size_t _input_width;
   std::vector<cudf::size_type> _partition_columns;
-  std::vector<whole_partition_aggregate> _aggregates;
+  /// The plan of a window of aggregates. Empty for a ranking window.
+  std::optional<whole_partition_plan> _aggregate_plan;
   ranking_order _ranking_order;
   std::vector<ranking_function> _ranking_functions;
 };

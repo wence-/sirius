@@ -19,14 +19,10 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
-#include <cudf/replace.hpp>
 #include <cudf/rolling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
-#include <cudf/transform.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/wrappers/durations.hpp>
 
@@ -181,54 +177,22 @@ plan_type::frame_strategy frame_strategy(window_frame const& frame,
 class plan_builder {
  public:
   plan_builder(std::vector<cudf::data_type> const& input_types, window_order const& order)
-    : _input_types(input_types), _order(order)
+    : aggregates(input_types, plan), _input_types(input_types), _order(order)
   {
   }
 
-  // The index of the frame for @p frame.
-  std::size_t frame(window_frame const& frame)
+  // The requests of the frame for @p frame.
+  std::vector<std::size_t>& frame(window_frame const& frame)
   {
     auto found = std::find(_frames.begin(), _frames.end(), frame);
-    if (found != _frames.end()) { return static_cast<std::size_t>(found - _frames.begin()); }
+    if (found != _frames.end()) { return plan.frames[found - _frames.begin()].requests; }
     _frames.push_back(frame);
     plan.frames.push_back({frame_strategy(frame, _order, _input_types), {}});
-    return plan.frames.size() - 1;
-  }
-
-  // The index of the value column derived from @p input by @p how.
-  std::size_t values(cudf::size_type input, plan_type::preparation how, cudf::data_type type)
-  {
-    // A cast to the input's own type is the input itself.
-    if (how == plan_type::preparation::cast && type == _input_types[input]) {
-      how = plan_type::preparation::none;
-    }
-    auto found = std::find_if(plan.values.begin(), plan.values.end(), [&](auto const& value) {
-      return value.input_column == input && value.how == how && value.type == type;
-    });
-    if (found != plan.values.end()) {
-      return static_cast<std::size_t>(found - plan.values.begin());
-    }
-    plan.values.push_back({input, how, type});
-    return plan.values.size() - 1;
-  }
-
-  // The index of the request for @p kind over @p values in @p frame.
-  std::size_t request(std::size_t frame, std::size_t values, plan_type::aggregation kind)
-  {
-    auto& members = plan.frames[frame].requests;
-    auto found    = std::find_if(members.begin(), members.end(), [&](std::size_t r) {
-      return plan.requests[r].values == values && plan.requests[r].kind == kind;
-    });
-    if (found != members.end()) { return *found; }
-    auto const is_count =
-      kind == plan_type::aggregation::count_valid || kind == plan_type::aggregation::count_all;
-    plan.requests.push_back(
-      {values, kind, is_count ? cudf::data_type{cudf::type_id::INT64} : plan.values[values].type});
-    members.push_back(plan.requests.size() - 1);
-    return plan.requests.size() - 1;
+    return plan.frames.back().requests;
   }
 
   plan_type plan;
+  detail::window_aggregate_plan_builder aggregates;
 
  private:
   std::vector<cudf::data_type> const& _input_types;
@@ -252,11 +216,6 @@ std::unique_ptr<cudf::rolling_aggregation> make_rolling_aggregation(plan_type::a
     case aggregation::max: return cudf::make_max_aggregation<cudf::rolling_aggregation>();
   }
   throw std::logic_error("Unknown rolling window aggregation");
-}
-
-bool is_count(plan_type::aggregation kind)
-{
-  return kind == plan_type::aggregation::count_valid || kind == plan_type::aggregation::count_all;
 }
 
 // A valid scalar holding @p delta in the unit of the order key type @p key. The plan checked that
@@ -446,28 +405,13 @@ class frame_runner {
 // Throws unless @p input has the columns the plan reads, with the types it was built for.
 void check_input(plan_type const& plan, cudf::table_view input)
 {
-  auto const check = [&](cudf::size_type index) {
-    if (index < 0 || index >= input.num_columns()) {
-      throw std::invalid_argument("Framed window input lacks a column of its plan");
-    }
-  };
-  for (auto index : plan.group_columns) {
-    check(index);
-  }
-  for (auto index : plan.order.columns) {
-    check(index);
-  }
-  for (auto const& value : plan.values) {
-    check(value.input_column);
-    if (value.how != plan_type::preparation::cast &&
-        input.column(value.input_column).type() != value.type) {
-      throw std::invalid_argument("Framed window input type differs from its plan");
-    }
-  }
+  auto indices = plan.group_columns;
+  indices.insert(indices.end(), plan.order.columns.begin(), plan.order.columns.end());
+  detail::check_window_input(plan, indices, input);
   for (auto const& frame : plan.frames) {
     if (auto const* range = std::get_if<plan_type::offset_range_frame>(&frame.strategy);
         range && input.column(plan.order.columns[0]).type() != range->key_type) {
-      throw std::invalid_argument("Framed window input type differs from its plan");
+      throw std::invalid_argument("Window input type differs from its plan");
     }
   }
 }
@@ -481,9 +425,7 @@ framed_window_plan plan_framed_window(std::vector<cudf::data_type> const& input_
 {
   if (aggregates.empty()) { throw std::invalid_argument("Window requires at least one aggregate"); }
   auto const check_index = [&](cudf::size_type index) {
-    if (index < 0 || static_cast<std::size_t>(index) >= input_types.size()) {
-      throw std::invalid_argument("Framed window column is outside the input schema");
-    }
+    detail::check_window_column(input_types, index);
   };
   for (auto index : group_columns) {
     check_index(index);
@@ -496,8 +438,6 @@ framed_window_plan plan_framed_window(std::vector<cudf::data_type> const& input_
     check_index(index);
   }
 
-  using preparation = plan_type::preparation;
-  using aggregation = plan_type::aggregation;
   plan_builder builder(input_types, order);
   builder.plan.group_columns = group_columns;
   builder.plan.order         = order;
@@ -506,66 +446,42 @@ framed_window_plan plan_framed_window(std::vector<cudf::data_type> const& input_
     auto const input    = requested.argument_column;
     check_index(input);
     validate(requested.frame, order.columns.size());
-    auto const type        = input_types[input];
-    auto const result_type = window_result_type(function, type);
+    auto const type = input_types[input];
+    if ((function == aggregate_id::min || function == aggregate_id::max) &&
+        type.id() != cudf::type_id::STRING &&
+        !cudf::is_valid_rolling_aggregation(
+          type, function == aggregate_id::min ? cudf::aggregation::MIN : cudf::aggregation::MAX)) {
+      // cuDF's support check does not know that rolling MIN and MAX run on strings through ARGMIN
+      // and ARGMAX.
+      throw std::invalid_argument("Unsupported window argument type");
+    }
     // Without order keys every row is a peer of every other, so a RANGE frame (which then has no
     // offset) is the whole partition.
-    auto const frame =
+    auto& frame =
       builder.frame(requested.frame.unit == frame_unit::range && order.columns.empty()
                       ? window_frame{frame_unit::rows, frame_unbounded{}, frame_unbounded{}}
                       : requested.frame);
-    auto const raw = builder.values(input, preparation::none, type);
-    framed_window_plan::output output{plan_type::output_request{0}, result_type, false};
-    switch (function) {
-      case aggregate_id::sum:
-        output.recipe = plan_type::output_request{builder.request(
-          frame, builder.values(input, preparation::cast, result_type), aggregation::sum)};
-        // Narrower arguments cannot reach DECIMAL(38) in fewer than 2^31 rows.
-        output.check_decimal38 = type.id() == cudf::type_id::DECIMAL128;
-        break;
-      case aggregate_id::avg:
-        output.recipe = plan_type::output_average{
-          builder.request(frame,
-                          builder.values(input, preparation::cast, window_sum_type(type)),
-                          aggregation::sum),
-          builder.request(frame, raw, aggregation::count_valid)};
-        break;
-      case aggregate_id::count:
-        output.recipe =
-          plan_type::output_request{builder.request(frame, raw, aggregation::count_valid)};
-        break;
-      case aggregate_id::count_star:
-        output.recipe =
-          plan_type::output_request{builder.request(frame, raw, aggregation::count_all)};
-        break;
-      case aggregate_id::min:
-      case aggregate_id::max: {
-        auto const kind = function == aggregate_id::min ? aggregation::min : aggregation::max;
-        // cuDF's support check does not know that rolling MIN and MAX run on strings through
-        // ARGMIN and ARGMAX.
-        if (type.id() != cudf::type_id::STRING &&
-            !cudf::is_valid_rolling_aggregation(
-              type,
-              function == aggregate_id::min ? cudf::aggregation::MIN : cudf::aggregation::MAX)) {
-          throw std::invalid_argument("Unsupported window argument type");
-        }
-        if (!cudf::is_floating_point(type)) {
-          output.recipe = plan_type::output_request{builder.request(frame, raw, kind)};
-          break;
-        }
-        auto const finite = builder.values(input, preparation::nans_to_nulls, type);
-        output.recipe =
-          plan_type::output_float_extremum{builder.request(frame, finite, kind),
-                                           builder.request(frame, finite, aggregation::count_valid),
-                                           builder.request(frame, raw, aggregation::count_valid),
-                                           function == aggregate_id::min};
-        break;
-      }
-      default: throw std::invalid_argument("Unsupported window function");
-    }
-    builder.plan.outputs.push_back(output);
+    // A rolling sum accumulates in the type of its result.
+    auto const sum_values =
+      function == aggregate_id::sum || function == aggregate_id::avg
+        ? builder.aggregates.values(input, plan_type::preparation::cast, window_sum_type(type))
+        : 0;
+    builder.aggregates.add_output(frame, function, input, sum_values);
   }
   return std::move(builder.plan);
+}
+
+std::vector<cudf::size_type> logical_type_columns(framed_window_plan const& plan)
+{
+  auto columns          = plan.argument_columns;
+  auto const has_offset = std::any_of(plan.frames.begin(), plan.frames.end(), [](auto const& f) {
+    return std::holds_alternative<plan_type::offset_range_frame>(f.strategy);
+  });
+  if (has_offset &&
+      std::find(columns.begin(), columns.end(), plan.order.columns[0]) == columns.end()) {
+    columns.push_back(plan.order.columns[0]);
+  }
+  return columns;
 }
 
 std::unique_ptr<cudf::table> evaluate_framed_window(framed_window_plan const& plan,
@@ -584,112 +500,19 @@ std::unique_ptr<cudf::table> evaluate_framed_window(framed_window_plan const& pl
   }
 
   // 1. Prepare the value columns.
-  std::vector<std::unique_ptr<cudf::column>> prepared;
-  std::vector<cudf::column_view> values;
-  for (auto const& value : plan.values) {
-    auto const input = sorted_input.column(value.input_column);
-    switch (value.how) {
-      case plan_type::preparation::none: values.push_back(input); continue;
-      case plan_type::preparation::cast:
-        prepared.push_back(cudf::cast(input, value.type, stream, mr));
-        break;
-      case plan_type::preparation::nans_to_nulls:
-        prepared.push_back(cudf::column_nans_to_nulls(input, stream, mr));
-        break;
-    }
-    values.push_back(prepared.back()->view());
-  }
+  auto values = detail::prepare_window_values(plan, sorted_input, stream, mr);
 
-  // 2. Run the requests, frame by frame. Counts become INT64 and 0 for an empty frame.
+  // 2. Run the requests, frame by frame.
   std::vector<std::unique_ptr<cudf::column>> results(plan.requests.size());
-  frame_runner runner(plan, sorted_input, values, results, stream, mr);
+  frame_runner runner(plan, sorted_input, values.views, results, stream, mr);
   for (auto const& frame : plan.frames) {
     runner.run(frame);
   }
-  values.clear();
-  prepared.clear();
-  auto const i64 = cudf::data_type{cudf::type_id::INT64};
-  for (std::size_t r = 0; r < plan.requests.size(); ++r) {
-    if (!is_count(plan.requests[r].kind)) { continue; }
-    auto& result = results[r];
-    if (result->type() != i64) { result = cudf::cast(result->view(), i64, stream, mr); }
-    if (result->has_nulls()) {
-      auto const zero = cudf::numeric_scalar<std::int64_t>(0, true, stream, mr);
-      result          = cudf::replace_nulls(result->view(), zero, stream, mr);
-    }
-  }
+  values = {};
 
-  // 3. Make each output from the request results. A result is moved to its last reader and
-  // copied for the others.
-  std::vector<int> readers(plan.requests.size(), 0);
-  auto const for_each_request = [](plan_type::output_recipe const& recipe, auto&& f) {
-    std::visit(
-      [&](auto const& r) {
-        using T = std::decay_t<decltype(r)>;
-        if constexpr (std::is_same_v<T, plan_type::output_request>) {
-          f(r.request);
-        } else if constexpr (std::is_same_v<T, plan_type::output_average>) {
-          f(r.sum);
-          f(r.count);
-        } else {
-          f(r.extremum);
-          f(r.finite_count);
-          f(r.count);
-        }
-      },
-      recipe);
-  };
-  for (auto const& output : plan.outputs) {
-    for_each_request(output.recipe, [&](std::size_t r) { ++readers[r]; });
-  }
-  auto const take = [&](std::size_t r) {
-    if (readers[r] == 1) { return std::move(results[r]); }
-    return std::make_unique<cudf::column>(results[r]->view(), stream, mr);
-  };
-  auto const bool8 = cudf::data_type{cudf::type_id::BOOL8};
-  auto const f64   = cudf::data_type{cudf::type_id::FLOAT64};
-  std::vector<std::unique_ptr<cudf::column>> output_columns;
-  for (auto const& output : plan.outputs) {
-    std::unique_ptr<cudf::column> column;
-    if (auto const* take_request = std::get_if<plan_type::output_request>(&output.recipe)) {
-      column = take(take_request->request);
-    } else if (auto const* average = std::get_if<plan_type::output_average>(&output.recipe)) {
-      auto sum   = cudf::cast(results[average->sum]->view(), f64, stream, mr);
-      auto count = cudf::cast(results[average->count]->view(), f64, stream, mr);
-      column     = cudf::binary_operation(
-        sum->view(), count->view(), cudf::binary_operator::DIV, f64, stream, mr);
-    } else {
-      auto const& extremum = std::get<plan_type::output_float_extremum>(output.recipe);
-      auto replace         = cudf::binary_operation(results[extremum.count]->view(),
-                                            results[extremum.finite_count]->view(),
-                                            cudf::binary_operator::GREATER,
-                                            bool8,
-                                            stream,
-                                            mr);
-      auto const& value    = results[extremum.extremum];
-      if (extremum.is_min) {
-        auto all_nan = cudf::is_null(value->view(), stream, mr);
-        replace      = cudf::binary_operation(
-          replace->view(), all_nan->view(), cudf::binary_operator::LOGICAL_AND, bool8, stream, mr);
-      }
-      auto nan = cudf::make_numeric_scalar(value->type(), stream, mr);
-      if (value->type().id() == cudf::type_id::FLOAT32) {
-        static_cast<cudf::numeric_scalar<float>&>(*nan).set_value(
-          std::numeric_limits<float>::quiet_NaN(), stream);
-      } else {
-        static_cast<cudf::numeric_scalar<double>&>(*nan).set_value(
-          std::numeric_limits<double>::quiet_NaN(), stream);
-      }
-      nan->set_valid_async(true, stream);
-      column = cudf::copy_if_else(*nan, value->view(), replace->view(), stream, mr);
-    }
-    for_each_request(output.recipe, [&](std::size_t r) {
-      if (--readers[r] == 0) { results[r].reset(); }
-    });
-    if (output.check_decimal38) { check_decimal38(column->view(), stream, mr); }
-    output_columns.push_back(std::move(column));
-  }
-  return std::make_unique<cudf::table>(std::move(output_columns));
+  // 3. Make each output from the request results.
+  return std::make_unique<cudf::table>(
+    detail::make_window_outputs(plan, std::move(results), stream, mr));
 }
 
 std::unique_ptr<cudf::table> evaluate_framed_window(

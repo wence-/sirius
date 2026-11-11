@@ -25,6 +25,7 @@
 #include "sirius_config.hpp"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace duckdb {
@@ -64,6 +65,8 @@ struct window_plan {
   std::vector<duckdb::idx_t> partition_slots;
   std::vector<std::unique_ptr<ast::node>> hidden_expressions;
   std::vector<whole_partition_expression> expressions;
+  // How the evaluator computes `expressions`, set when there are any.
+  std::optional<op::whole_partition_plan> aggregate_plan;
   std::vector<ranking_window_expression> rankings;
   // Order key slots, direction and NULL placement shared by all `rankings`.
   op::ranking_order ranking_order;

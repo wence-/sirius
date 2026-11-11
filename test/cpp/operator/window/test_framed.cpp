@@ -801,6 +801,21 @@ TEST_CASE("framed window plan shares work and is decided from types alone", "[wi
   CHECK(forward.end.delta == -1);
   CHECK_FALSE(forward.clamp_reversed);
   CHECK(std::get<plan_type::offset_range_frame>(plan.frames[3].strategy).clamp_reversed);
+  // Every value column is read by a request.
+  for (std::size_t v = 0; v < plan.values.size(); ++v) {
+    CHECK(std::any_of(plan.requests.begin(), plan.requests.end(), [&](auto const& request) {
+      return request.values == v;
+    }));
+  }
+  // The arguments need their logical types, and so does the order key of a RANGE offset frame,
+  // but not the key of a frame of peers or the group columns.
+  CHECK(plan.argument_columns == std::vector<cudf::size_type>{1, 2, 3});
+  using columns = std::vector<cudf::size_type>;
+  CHECK(sirius::op::logical_type_columns(plan) == columns{1, 2, 3});
+  CHECK(sirius::op::logical_type_columns(sirius::op::plan_framed_window(
+          types, {0}, ascending({1}), {{function::sum, 3, offset}})) == columns{3, 1});
+  CHECK(sirius::op::logical_type_columns(sirius::op::plan_framed_window(
+          types, {0}, ascending({1}), {{function::sum, 3, running}})) == columns{3});
   // Huge ROWS offsets are clamped so that cuDF's bound arithmetic cannot overflow.
   auto const huge = sirius::op::plan_framed_window(
     types,

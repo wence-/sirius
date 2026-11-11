@@ -34,26 +34,26 @@ namespace sirius::op {
 sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> output_types,
                                                duckdb::vector<logical_type> prepared_types,
                                                std::size_t input_width,
-                                               std::vector<cudf::size_type> partition_columns,
-                                               std::vector<whole_partition_aggregate> aggregates,
+                                               whole_partition_plan plan,
                                                std::size_t estimated_cardinality)
   : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
     _prepared_types(std::move(prepared_types)),
     _input_width(input_width),
-    _partition_columns(std::move(partition_columns)),
-    _aggregates(std::move(aggregates))
+    _partition_columns(plan.group_columns),
+    _aggregate_plan(std::move(plan))
 {
   auto const valid_slot = [&](cudf::size_type slot) {
     return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
   };
-  if (_aggregates.empty() ||
+  if (_aggregate_plan->outputs.empty() ||
       !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
-      !std::all_of(_aggregates.begin(), _aggregates.end(), [&](auto const& aggregate) {
-        return valid_slot(aggregate.argument_column);
-      })) {
+      !std::all_of(_aggregate_plan->argument_columns.begin(),
+                   _aggregate_plan->argument_columns.end(),
+                   valid_slot)) {
     throw std::invalid_argument("Window key or argument is outside its prepared schema");
   }
-  if (_input_width > _prepared_types.size() || types.size() != _input_width + _aggregates.size()) {
+  if (_input_width > _prepared_types.size() ||
+      types.size() != _input_width + _aggregate_plan->outputs.size()) {
     throw std::invalid_argument("Window output schema does not match its prepared input");
   }
 }
@@ -118,7 +118,8 @@ std::size_t sirius_physical_window::workspace_bytes(std::size_t rows, std::size_
   // group per row. History refines this after execution, and native OOM follows ordinary retries.
   // A ranking window needs about 24 bytes per row for each function: the INT32 scan result, the
   // scattered result and the INT64 cast. The sort order is shared by all functions.
-  auto per_row = memory::saturating_add(128, memory::saturating_mul(_aggregates.size(), 128));
+  auto const aggregates = _aggregate_plan ? _aggregate_plan->outputs.size() : 0;
+  auto per_row          = memory::saturating_add(128, memory::saturating_mul(aggregates, 128));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_ranking_functions.size(), 24));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_partition_columns.size(), 32));
   per_row =
@@ -180,18 +181,14 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
     };
     // Ranking only reads the equality and the order of its keys, which an exact narrower carrier
     // keeps, so its keys are used as they are.
-    if (_ranking_functions.empty()) {
-      for (auto slot : _partition_columns) {
+    if (_aggregate_plan) {
+      for (auto slot : logical_type_columns(*_aggregate_plan)) {
         restore(slot);
-      }
-      for (auto const& aggregate : _aggregates) {
-        restore(aggregate.argument_column);
       }
     }
     std::shared_ptr<cudf::table> results =
-      _ranking_functions.empty()
-        ? evaluate_whole_partition_window(
-            cudf::table_view(columns), _partition_columns, _aggregates, stream, mr)
+      _aggregate_plan
+        ? evaluate_whole_partition_window(*_aggregate_plan, cudf::table_view(columns), stream, mr)
         : evaluate_ranking_window(cudf::table_view(columns),
                                   _partition_columns,
                                   _ranking_order,
