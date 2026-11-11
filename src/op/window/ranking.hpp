@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "op/window/aggregate_typing.hpp"
+
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -42,21 +44,8 @@ enum class ranking_function {
   row_number,
 };
 
-/**
- * @brief The ORDER BY of a ranking window.
- *
- * `directions` and `nulls` have one entry for each of `columns`.
- */
-struct ranking_order {
-  /// Indices of the order key columns in the input table. Must not be empty.
-  std::vector<cudf::size_type> columns;
-  /// Direction of each order key.
-  std::vector<cudf::order> directions;
-  /// Where NULLs sort for each order key, in the cuDF sense: applied in the ascending frame and
-  /// reversed for a descending direction. `to_cudf_null_order` converts SQL `NULLS FIRST` and
-  /// `NULLS LAST`.
-  std::vector<cudf::null_order> nulls;
-};
+/// The ORDER BY of a ranking window. `columns` must not be empty.
+using ranking_order = window_order;
 
 /**
  * @brief Evaluate ranking functions over each partition of the input.

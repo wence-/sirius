@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "expression/aggregate_id.hpp"
+#include "op/window/aggregate_typing.hpp"
 
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -30,27 +30,8 @@
 
 namespace sirius::op {
 
-/// 10^@p digits as a signed 128 bit integer.
-constexpr __int128_t int128_pow10(int digits)
-{
-  __int128_t value = 1;
-  for (int i = 0; i < digits; ++i) {
-    value *= 10;
-  }
-  return value;
-}
-
-/**
- * @brief One aggregate to evaluate over the whole partition.
- */
-struct whole_partition_aggregate {
-  /// One of `sum` (`sum_no_overflow` is treated as `sum`), `avg`, `count`, `count_star`, `min` and
-  /// `max`. Any other id is rejected.
-  sirius::aggregate_id function;
-  /// Index of the argument column in the input table. `count_star` counts rows including NULLs, so
-  /// any column serves as its argument.
-  cudf::size_type argument_column;
-};
+/// One aggregate to evaluate over the whole partition.
+using whole_partition_aggregate = window_aggregate;
 
 /**
  * @brief Evaluate aggregates over the whole partition of every row.
