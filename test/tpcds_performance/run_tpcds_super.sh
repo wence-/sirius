@@ -15,6 +15,7 @@
 # Options:
 #   --queries <N...>      Specific query numbers to run (default: all 1-99)
 #   --output-dir <path>   Directory for results
+#   --single-process      Reuse one DuckDB process and create views once
 # =============================================================================
 
 set -uo pipefail
@@ -23,12 +24,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
-DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
+DUCKDB_ARGS=(-unsigned -no-agent -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';" -cmd "SET parquet_metadata_cache = true;" -cmd "SET gpu_execution = true;" -cmd "SET enable_duckdb_fallback = false;")
 QUERY_DIR="$SCRIPT_DIR/queries"
 
 # --- Parse arguments ---
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <parquet_dir> [--queries N...] [--output-dir path]"
+    echo "Usage: $0 <parquet_dir> [--queries N...] [--output-dir path] [--single-process]"
     echo "Example: $0 /data/tpcds_parquet_sf1 --queries 3 7 17 25"
     exit 1
 fi
@@ -37,10 +38,15 @@ PARQUET_DIR="$1"
 shift
 
 OUTPUT_DIR=""
+SINGLE_PROCESS=false
 QUERIES=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --single-process)
+            SINGLE_PROCESS=true
+            shift
+            ;;
         --output-dir)
             OUTPUT_DIR="$2"
             shift 2
@@ -144,6 +150,57 @@ parse_timer_output() {
     echo "$1" | grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+'
 }
 
+# Keep label-setting calls outside the two query timing measurements.
+emit_query_runs() {
+    local query_number="$1" query_sql="$2" run_number
+    for run_number in 1 2; do
+        printf ".timer off\n.once /dev/null\nCALL sirius_set_query_label('tpcds_q%s_run%s');\n.timer on\n%s;\n" \
+            "$query_number" "$run_number" "$query_sql"
+    done
+}
+
+# In shared-process mode, retain the CLI's native rendering and timer output.
+# Markers route merged stdout/stderr to the same per-query files as isolated runs.
+if $SINGLE_PROCESS; then
+    command -v stdbuf >/dev/null || { echo "ERROR: --single-process requires stdbuf"; exit 1; }
+    SHARED_TMP=$(mktemp -d)
+    trap 'rm -rf "$SHARED_TMP"' EXIT
+    MARKER="SIRIUS_BENCH_${BASHPID}_${RANDOM}"
+    {
+        printf '%s\n' "$VIEW_SQL"
+        # Startup/view errors still bail; unsupported queries must allow the suite to continue.
+        printf '.bail off\n.timer on\n'
+        for q in "${QUERIES[@]}"; do
+            [[ "$q" =~ ^[0-9]+$ ]] || { echo "Invalid query number: $q" >&2; exit 1; }
+            QUERY_FILE="$QUERY_DIR/q${q}.sql"
+            [ -s "$QUERY_FILE" ] || continue
+            QUERY_SQL=$(cat "$QUERY_FILE")
+            [ -n "$QUERY_SQL" ] || continue
+            CLEANED_SQL=$(echo "$QUERY_SQL" | sed 's/;[[:space:]]*$//')
+            printf '.print %s START %s\n' "$MARKER" "$q"
+            emit_query_runs "$q" "$CLEANED_SQL"
+            printf '.print %s END\n' "$MARKER"
+        done
+    } > "$SHARED_TMP/suite.sql"
+    # Line buffering keeps diagnostics ordered with the result and timer lines.
+    stdbuf -oL -eL "$DUCKDB" "${DUCKDB_ARGS[@]}" < "$SHARED_TMP/suite.sql" 2>&1 |
+        awk -v marker="$MARKER" -v out="$SHARED_TMP" '
+            $1 == marker && $2 == "START" {
+                file = out "/log_q" $3 ".txt"
+                print "Executing query " $3 " (shared process)..."
+                fflush()
+                next
+            }
+            $0 == marker " END" { close(file); file = ""; next }
+            { if (file != "") print > file; else print > (out "/startup.log") }
+        '
+    # DuckDB exits nonzero for SQL errors even with .bail off. Per-query logs
+    # carry those errors; do not treat that exit alone as a failed suite startup.
+    if [ -s "$SHARED_TMP/startup.log" ]; then
+        cp "$SHARED_TMP/startup.log" "$OUTPUT_DIR/startup.log"
+    fi
+fi
+
 # --- Run each query ---
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
@@ -165,24 +222,26 @@ for q in "${QUERIES[@]}"; do
     # Strip trailing semicolons from the query
     CLEANED_SQL=$(echo "$QUERY_SQL" | sed 's/;[[:space:]]*$//')
 
-    # Write SQL file: views, timer, then two runs of plain SQL.
-    # Transparent execution routes queries through GPU when SiriusContext is initialized.
-    TEMP_SQL="$OUTPUT_DIR/tmp_q${q}.sql"
-    {
-        printf '%s\n' "$VIEW_SQL"
-        printf ".timer on\n"
-        printf '%s;\n' "$CLEANED_SQL"
-        printf '%s;\n' "$CLEANED_SQL"
-    } > "$TEMP_SQL"
-
     Q_RESULT_FILE="$OUTPUT_DIR/result_q${q}.txt"
     Q_LOG="$OUTPUT_DIR/log_q${q}.txt"
 
-    # Run in a fresh DuckDB process (no database file needed — views read parquet)
-    OUTPUT=$("$DUCKDB" "${DUCKDB_ARGS[@]}" < "$TEMP_SQL" 2>&1) || true
-
+    if $SINGLE_PROCESS; then
+        if [ ! -f "$SHARED_TMP/log_q${q}.txt" ]; then
+            echo "ERROR: Shared DuckDB process did not reach query $q. See startup.log and preceding query logs." >&2
+            exit 1
+        fi
+        OUTPUT=$(cat "$SHARED_TMP/log_q${q}.txt")
+    else
+        TEMP_SQL="$OUTPUT_DIR/tmp_q${q}.sql"
+        {
+            printf '%s\n' "$VIEW_SQL"
+            printf '.timer on\n'
+            emit_query_runs "$q" "$CLEANED_SQL"
+        } > "$TEMP_SQL"
+        OUTPUT=$("$DUCKDB" "${DUCKDB_ARGS[@]}" < "$TEMP_SQL" 2>&1) || true
+        rm -f "$TEMP_SQL"
+    fi
     echo "$OUTPUT" > "$Q_LOG"
-    rm -f "$TEMP_SQL"
 
     # Parse timer output — expect two "Run Time" lines
     readarray -t TIMES < <(parse_timer_output "$OUTPUT")
@@ -193,7 +252,7 @@ for q in "${QUERIES[@]}"; do
     # Check for errors in the output
     HAS_ERROR=$(echo "$OUTPUT" | grep -ci "error" || true)
 
-    if [ "$HAS_ERROR" -gt 0 ] && [ "$RUN1_TIME" = "-1" ]; then
+    if [ "$HAS_ERROR" -gt 0 ]; then
         ERROR_MSG=$(echo "$OUTPUT" | grep -i "error" | head -1)
         echo "  Run 1: FAILED — $ERROR_MSG"
         echo "  Run 2: FAILED"
@@ -247,3 +306,5 @@ echo ""
 echo "Timings:  $TIMING_FILE"
 echo "Results:  $OUTPUT_DIR/result_q*.txt"
 echo "Logs:     $OUTPUT_DIR/log_q*.txt"
+
+exit 0

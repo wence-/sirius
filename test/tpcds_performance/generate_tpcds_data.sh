@@ -98,32 +98,32 @@ else
 fi
 
 # --- Generate TPC-DS data ---
-if [ "$FORMAT" = "duckdb" ]; then
-    echo ""
-    echo "Generating TPC-DS data at SF${SF} into $OUTPUT ..."
-    if [ -f "$OUTPUT" ]; then
-        echo "WARNING: Database file already exists, will overwrite tables"
-    fi
+# if [ "$FORMAT" = "duckdb" ]; then
+#     echo ""
+#     echo "Generating TPC-DS data at SF${SF} into $OUTPUT ..."
+#     if [ -f "$OUTPUT" ]; then
+#         echo "WARNING: Database file already exists, will overwrite tables"
+#     fi
 
-    "$DUCKDB" "$OUTPUT" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=${SF}, overwrite=true);"
-    echo "Done. Database saved to: $OUTPUT"
+#     "$DUCKDB" "$OUTPUT" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=${SF}, overwrite=true);"
+#     echo "Done. Database saved to: $OUTPUT"
 
-elif [ "$FORMAT" = "parquet" ]; then
-    echo ""
-    echo "Generating TPC-DS data at SF${SF} (parquet export to $OUTPUT) ..."
-    mkdir -p "$OUTPUT"
+# elif [ "$FORMAT" = "parquet" ]; then
+#     echo ""
+#     echo "Generating TPC-DS data at SF${SF} (parquet export to $OUTPUT) ..."
+#     mkdir -p "$OUTPUT"
 
-    TEMP_DB="$PROJECT_DIR/tpcds_gen_tmp.duckdb"
-    rm -f "$TEMP_DB"
-    "$DUCKDB" "$TEMP_DB" <<EOF
-INSTALL tpcds;
-LOAD tpcds;
-CALL dsdgen(sf=${SF});
-EXPORT DATABASE '${OUTPUT}' (FORMAT PARQUET);
-EOF
-    rm -f "$TEMP_DB"
-    echo "Done. Parquet files saved to: $OUTPUT"
-fi
+#     TEMP_DB="$PROJECT_DIR/tpcds_gen_tmp.duckdb"
+#     rm -f "$TEMP_DB"
+#     "$DUCKDB" "$TEMP_DB" <<EOF
+# INSTALL tpcds;
+# LOAD tpcds;
+# CALL dsdgen(sf=${SF});
+# EXPORT DATABASE '${OUTPUT}' (FORMAT PARQUET);
+# EOF
+#     rm -f "$TEMP_DB"
+#     echo "Done. Parquet files saved to: $OUTPUT"
+# fi
 
 echo ""
 echo "Summary:"
